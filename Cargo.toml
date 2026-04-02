@@ -1,0 +1,30 @@
+[package]
+name = "primordium"
+version = "0.1.0"
+edition = "2024"
+description = "Pixel-based evolutionary cell simulator"
+
+[dependencies]
+# Windowing and rendering
+pixels = "0.14"
+winit = "0.30"
+
+# Serialization (config loading)
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# RNG (deterministic, seeded)
+rand = "0.8"
+rand_chacha = "0.3"
+
+# Noise generation (temperature map)
+noise = "0.9"
+
+# Lock-free snapshot transfer between threads
+arc-swap = "1"
+
+# Error handling
+anyhow = "1"
+
+[dev-dependencies]
+proptest = "1"
