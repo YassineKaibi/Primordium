@@ -329,7 +329,10 @@ mod tests {
 
         let high_val = 200.0 / 255.0;
         for i in 0..12 {
-            assert!((eff[i] - high_val).abs() < 1e-6, "gene {i} should be ungated");
+            assert!(
+                (eff[i] - high_val).abs() < 1e-6,
+                "gene {i} should be ungated"
+            );
         }
         let low_val = (100.0 / 255.0) * 0.1;
         for i in 12..BASE_GENE_COUNT {
@@ -454,7 +457,11 @@ mod tests {
         // After armor/speed pair: speed reads current 0.3, armor reads 1.0
         //   armor = 1.0*(1-0.3*0.7) = 1.0*0.79 = 0.79
         //   speed = 0.3*(1-1.0*0.7) = 0.3*0.3 = 0.09
-        assert!(eff[SPEED] < 0.1, "multi-pair gene should be heavily penalized: {}", eff[SPEED]);
+        assert!(
+            eff[SPEED] < 0.1,
+            "multi-pair gene should be heavily penalized: {}",
+            eff[SPEED]
+        );
         assert!(eff[SPEED] > 0.0, "but never negative");
     }
 
@@ -546,4 +553,3 @@ mod tests {
         assert_eq!(g1.data, g2.data);
     }
 }
-

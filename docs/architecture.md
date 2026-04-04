@@ -41,7 +41,7 @@ Tile {
     pheromone: f32        // signal layer
     toxin: f32            // pollution layer
     temperature: u8       // static, set at init
-    sunlight: u8          // static, derived from Y position
+    sunlight: u8          // dynamic, Beer-Lambert column scan each tick
 }
 ```
 
@@ -150,6 +150,7 @@ Each call to `simulation.step()` executes these phases in order:
 - Diffuse toxin field (slow decay, slow spread, 4-neighbor)
 - Diffuse temperature field (near-zero decay, very slow spread, 8-neighbor)
 - Fade decay matter on all tiles
+- Recompute sunlight via Beer-Lambert column scan (per-tile α from cells, decay, toxin, pheromone)
 
 Each diffusion pass reads from one buffer, writes to the other, then swaps. The two diffusion buffers are reused across all three layers.
 
