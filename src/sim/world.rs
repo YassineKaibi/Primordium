@@ -310,6 +310,24 @@ impl World {
         }
     }
 
+    /// Read-only access to the current (readable) grid.
+    #[inline]
+    pub fn current_grid(&self) -> &[Tile] {
+        &self.grids[self.current]
+    }
+
+    /// Mutable access to the current grid (for in-place updates like diffusion).
+    #[inline]
+    pub fn current_grid_mut(&mut self) -> &mut [Tile] {
+        &mut self.grids[self.current]
+    }
+
+    /// Set the cell_id on a tile in the current grid (used by spawner).
+    pub fn set_current_tile_cell_id(&mut self, x: u16, y: u16, cell_id: u32) {
+        let idx = self.tile_index(x, y);
+        self.grids[self.current][idx].cell_id = cell_id;
+    }
+
     /// Total number of live cells (excluding sentinel).
     pub fn population(&self) -> u32 {
         (self.cells.len() as u32 - 1) - self.free_list.len() as u32

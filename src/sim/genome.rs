@@ -152,8 +152,8 @@ impl Genome {
         let mut eff = [0.0_f32; BASE_GENE_COUNT];
 
         // Step 0: normalize raw bytes to 0.0..1.0
-        for i in 0..BASE_GENE_COUNT {
-            eff[i] = self.data[i] as f32 / 255.0;
+        for (i, val) in eff.iter_mut().enumerate().take(BASE_GENE_COUNT) {
+            *val = self.data[i] as f32 / 255.0;
         }
 
         // Step 1: antagonistic pairs
