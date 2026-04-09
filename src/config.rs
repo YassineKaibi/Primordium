@@ -29,6 +29,8 @@ pub struct WorldConfig {
     pub toxin_decay: f32,
     pub toxin_diffusion: f32,
     pub toxin_generation_threshold: u32,
+    /// Radius for counting nearby deaths when generating toxin at death sites.
+    pub toxin_generation_radius: u32,
 
     // Decay
     pub decay_rate: f32,
@@ -73,6 +75,7 @@ impl Default for WorldConfig {
             toxin_decay: 0.005,
             toxin_diffusion: 0.02,
             toxin_generation_threshold: 10,
+            toxin_generation_radius: 2,
 
             decay_rate: 0.02,
 
