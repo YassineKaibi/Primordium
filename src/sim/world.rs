@@ -210,6 +210,14 @@ impl World {
         &self.grids[self.current][idx]
     }
 
+    /// Read a tile from the next (writable) grid without mutating.
+    #[inline]
+    pub fn next_tile(&self, x: u16, y: u16) -> &Tile {
+        let idx = self.tile_index(x, y);
+        let next = 1 - self.current;
+        &self.grids[next][idx]
+    }
+
     /// Get a mutable reference to a tile in the next (writable) grid.
     #[inline]
     pub fn next_tile_mut(&mut self, x: u16, y: u16) -> &mut Tile {
