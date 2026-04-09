@@ -330,6 +330,27 @@ impl World {
         &mut self.grids[self.current]
     }
 
+    /// Read-only access to the next (writable) grid.
+    #[inline]
+    pub fn next_grid(&self) -> &[Tile] {
+        let next = 1 - self.current;
+        &self.grids[next]
+    }
+
+    /// Mutable access to the next (writable) grid.
+    #[inline]
+    pub fn next_grid_mut(&mut self) -> &mut [Tile] {
+        let next = 1 - self.current;
+        &mut self.grids[next]
+    }
+
+    /// Return IDs of all live cells (energy > 0, excluding sentinel at index 0).
+    pub fn cell_ids(&self) -> Vec<u32> {
+        (1..self.cells.len() as u32)
+            .filter(|&id| !self.free_list.contains(&id) && self.cells[id as usize].is_alive())
+            .collect()
+    }
+
     /// Set the cell_id on a tile in the current grid (used by spawner).
     pub fn set_current_tile_cell_id(&mut self, x: u16, y: u16, cell_id: u32) {
         let idx = self.tile_index(x, y);
@@ -694,5 +715,31 @@ mod tests {
         assert_eq!(snap.cells[0].1, 3);
         assert_eq!(snap.stats.population, 1);
         assert!((snap.decay_map[idx] - 7.5).abs() < f32::EPSILON);
+    }
+
+    // ── Grid accessors ──────────────────────────────────────────────
+
+    #[test]
+    fn next_grid_accessible() {
+        let config = small_config();
+        let world = World::new(&config);
+        let total = (config.grid_width * config.grid_height) as usize;
+        assert_eq!(world.next_grid().len(), total);
+    }
+
+    #[test]
+    fn cell_ids_returns_live_cells() {
+        let config = small_config();
+        let mut world = World::new(&config);
+        let genome = Genome::new([50u8; GENOME_LEN]);
+        let cell = Cell::new(genome, 100.0, (3, 3));
+        let id = world.spawn_cell(cell);
+        // cell_ids should include the spawned cell
+        let ids = world.cell_ids();
+        assert!(ids.contains(&id));
+        // kill it — should no longer appear
+        world.kill_cell(id);
+        let ids = world.cell_ids();
+        assert!(!ids.contains(&id));
     }
 }
