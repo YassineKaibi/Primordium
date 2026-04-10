@@ -620,13 +620,8 @@ pub struct ShareOutcome {
 ///
 /// Transfer amount = `resource_sharing * donor_energy * 0.1`, capped so
 /// donor doesn't go below zero.
-pub fn resolve_share(
-    donor: &Cell,
-    donor_genes: &DecodedGenes,
-    recipient: &Cell,
-) -> ShareOutcome {
-    let shared_energy =
-        (donor_genes.get(genome::RESOURCE_SHARING) * donor.energy * 0.1).max(0.0);
+pub fn resolve_share(donor: &Cell, donor_genes: &DecodedGenes, recipient: &Cell) -> ShareOutcome {
+    let shared_energy = (donor_genes.get(genome::RESOURCE_SHARING) * donor.energy * 0.1).max(0.0);
     let donor_energy = donor.energy - shared_energy;
     let recipient_energy = recipient.energy + shared_energy;
     ShareOutcome {
@@ -1548,10 +1543,7 @@ mod tests {
 
     /// Helper: set up a world with cells placed on the current grid.
     /// Returns (world, cell_ids).
-    fn setup_world_with_cells(
-        config: &WorldConfig,
-        cells: Vec<Cell>,
-    ) -> (World, Vec<u32>) {
+    fn setup_world_with_cells(config: &WorldConfig, cells: Vec<Cell>) -> (World, Vec<u32>) {
         let mut world = World::new(config);
         let mut ids = Vec::new();
         for cell in cells {
@@ -1668,8 +1660,10 @@ mod tests {
         let cell_c = make_cell_at(10, 10, make_genome(50), 30.0);
 
         // Run with order A
-        let (mut world_a, ids_a) =
-            setup_world_with_cells(&config, vec![cell_a.clone(), cell_b.clone(), cell_c.clone()]);
+        let (mut world_a, ids_a) = setup_world_with_cells(
+            &config,
+            vec![cell_a.clone(), cell_b.clone(), cell_c.clone()],
+        );
         let mut rng_a = ChaCha8Rng::seed_from_u64(99);
         let actions_a = vec![
             (ids_a[0], Action::Reproduce(4, 3)),
@@ -1679,8 +1673,10 @@ mod tests {
         resolve_all(&actions_a, &mut world_a, &config, &mut rng_a);
 
         // Run with reversed order
-        let (mut world_b, ids_b) =
-            setup_world_with_cells(&config, vec![cell_a.clone(), cell_b.clone(), cell_c.clone()]);
+        let (mut world_b, ids_b) = setup_world_with_cells(
+            &config,
+            vec![cell_a.clone(), cell_b.clone(), cell_c.clone()],
+        );
         let mut rng_b = ChaCha8Rng::seed_from_u64(99);
         let actions_b = vec![
             (ids_b[2], Action::Idle),
@@ -1690,10 +1686,22 @@ mod tests {
         resolve_all(&actions_b, &mut world_b, &config, &mut rng_b);
 
         // Compare next-grid state: same cells at same positions
-        assert_eq!(world_a.next_tile(3, 3).cell_id, world_b.next_tile(3, 3).cell_id);
-        assert_eq!(world_a.next_tile(4, 3).cell_id, world_b.next_tile(4, 3).cell_id);
-        assert_eq!(world_a.next_tile(8, 7).cell_id, world_b.next_tile(8, 7).cell_id);
-        assert_eq!(world_a.next_tile(10, 10).cell_id, world_b.next_tile(10, 10).cell_id);
+        assert_eq!(
+            world_a.next_tile(3, 3).cell_id,
+            world_b.next_tile(3, 3).cell_id
+        );
+        assert_eq!(
+            world_a.next_tile(4, 3).cell_id,
+            world_b.next_tile(4, 3).cell_id
+        );
+        assert_eq!(
+            world_a.next_tile(8, 7).cell_id,
+            world_b.next_tile(8, 7).cell_id
+        );
+        assert_eq!(
+            world_a.next_tile(10, 10).cell_id,
+            world_b.next_tile(10, 10).cell_id
+        );
 
         // Parent energies should match
         let pa = world_a.get_cell(ids_a[0]);
