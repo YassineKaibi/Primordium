@@ -22,9 +22,9 @@ The simulation is deterministic: identical seeds produce identical outcomes. Thi
 |-------|------------------------|-----------------------------------------------------------------------------|
 | 0     | `photosynthesis_rate`  | Energy gained from sunlight per tick. Effective only in lit zones.           |
 | 1     | `thermosynthesis_rate` | Energy gained from thermal vents. Effective only near vents.                |
-| 2     | `predation_efficiency` | Percentage of victim's energy absorbed on kill.                             |
-| 3     | `scavenge_ability`     | Energy extracted from decay matter on a tile.                               |
-| 4     | `energy_storage_cap`   | Maximum energy the cell can hold. Excess is wasted.                         |
+| 2     | `predation_efficiency` | Percentage of victim's energy absorbed on kill, scaled within `max_predation_efficiency` (the gene has no antagonist). With `corpses_keep_energy`, the part the killer does not absorb stays on the victim's tile as decay matter. |
+| 3     | `scavenge_ability`     | Energy extracted from decay matter on a tile, per tick, capped by `max_scavenge_per_tick`. It is a rate, not a swallow: uncapped, a maxed scavenger clears the whole tile on arrival and a corpse is one meal rather than a food source. |
+| 4     | `energy_storage_cap`   | Maximum energy the cell can hold, between `energy_cap_floor` and `energy_cap_max`. Excess is wasted. |
 | 5     | `base_metabolism`      | Passive energy drain per tick. Lower is more efficient, but antagonistic pairs and active gene expression push effective cost higher. |
 
 #### Movement (6 genes)
@@ -34,8 +34,8 @@ The simulation is deterministic: identical seeds produce identical outcomes. Thi
 | 6     | `speed`               | Probability of moving each tick. 0 = sessile, 255 = moves every tick.   |
 | 7     | `direction_bias`      | Preferred heading. 0-255 maps linearly to 0-360 degrees.               |
 | 8     | `direction_noise`     | Randomness added to movement direction. Low = straight lines, high = Brownian. |
-| 9     | `chemotaxis_strength` | Tendency to move toward nearby energy sources.                          |
-| 10    | `flee_response`       | Tendency to move away from larger or aggressive neighbors.              |
+| 9     | `chemotaxis_strength` | Tendency to move toward nearby energy sources. With `foragers_stay_on_food` that includes the source underfoot: a cell's chance of moving is scaled by `1 - chemotaxis_strength * share`, where `share` is its own tile's food against the richest other food tile in sense range. |
+| 10    | `flee_response`       | Tendency to move away from larger or aggressive neighbors. With `flee_can_escape`, a cell flees with probability `speed * flee_response`, only from the nearest non-kin whose blow (attack beats armour) or venom would cost it energy, and a strike misses a target that has moved out of the attacker's reach. |
 | 11    | `pack_affinity`       | Tendency to move toward genetically similar cells.                      |
 
 #### Combat (5 genes)
@@ -52,10 +52,10 @@ The simulation is deterministic: identical seeds produce identical outcomes. Thi
 
 | Index | Gene                     | Description                                                         |
 |-------|--------------------------|---------------------------------------------------------------------|
-| 17    | `reproduction_threshold` | Energy level at which the cell splits.                              |
-| 18    | `offspring_energy_share` | Percentage of parent energy transferred to offspring.               |
-| 19    | `mutation_rate`          | Per-gene probability of mutation during reproduction.               |
-| 20    | `mutation_magnitude`     | Maximum shift applied to a mutated gene value.                      |
+| 17    | `reproduction_threshold` | Fraction of storage capacity at which the cell splits, never below `reproduction_energy_floor`. |
+| 18    | `offspring_energy_share` | Percentage of parent energy transferred to offspring, bounded to `[min_offspring_energy_share, max_offspring_energy_share]` so that both leave the split alive: a share of 0 made a zero-energy child (a birth, a corpse, and `corpse_biomass` of decay from nothing) and a share of 1 killed the parent. |
+| 19    | `mutation_rate`          | Per-gene probability of mutation during reproduction, scaled within `max_mutation_rate`. |
+| 20    | `mutation_magnitude`     | Maximum shift applied to a mutated gene value, scaled within `max_mutation_magnitude`. |
 | 21    | `reproduction_cooldown`  | Minimum ticks between successive reproductions.                     |
 | 22    | `offspring_scatter`      | Distance from parent at which offspring spawns. Capped by `sense_radius`. |
 
@@ -75,17 +75,17 @@ The simulation is deterministic: identical seeds produce identical outcomes. Thi
 |-------|-------------|--------------------------------------------------------------------------------|
 | 28    | `adhesion`  | Tendency to stick to adjacent genetically similar cells. Enables cluster formation. |
 | 29    | `rigidity`  | Resistance to being displaced or pushed by other cells.                        |
-| 30    | `decay_rate`| How long the cell's corpse persists as scavengeable decay matter.              |
+| 30    | `decay_rate`| How long the cell's corpse persists as scavengeable decay matter. Scales the world's `decay_rate` between `corpse_decay_scale_min` and `corpse_decay_scale_max`, and travels with the deposit on the tile. |
 | 31    | `membrane`  | Resistance to venom and environmental damage (toxin).                          |
 
 #### Lifecycle (4 genes)
 
 | Index | Gene               | Description                                                              |
 |-------|--------------------|--------------------------------------------------------------------------|
-| 32    | `max_age`          | Tick count before natural death.                                         |
-| 33    | `maturity_age`     | Ticks before reproduction is unlocked.                                   |
-| 34    | `dormancy_trigger` | Energy threshold below which the cell enters dormancy phase.             |
-| 35    | `dormancy_cost`    | Energy drain rate while in dormancy (lower = better hibernation).        |
+| 32    | `max_age`          | Tick count before natural death, between `min_lifespan_ticks` and `max_lifespan_ticks`. |
+| 33    | `maturity_age`     | Ticks before reproduction is unlocked. Capped by `max_age` (see Physical Caps). |
+| 34    | `dormancy_trigger` | Energy threshold below which the cell enters dormancy phase, scaled into `[0, max_dormancy_trigger]` — dormancy is a last resort, not an operating mode. A dormant cell takes **no action at all** — it cannot reproduce, attack, flee or move until income lifts it back above the trigger. |
+| 35    | `dormancy_cost`    | Energy drain rate while in dormancy (lower = better hibernation). Multiplies metabolic cost, floored at `min_dormancy_cost` so a cheap hibernator is not immortal; venom and toxin damage are unaffected. |
 
 #### Environmental (3 genes)
 
@@ -93,7 +93,7 @@ The simulation is deterministic: identical seeds produce identical outcomes. Thi
 |-------|------------------------|----------------------------------------------------------------------|
 | 36    | `temperature_preference`| Optimal temperature zone. Mismatch with local temp = extra metabolism cost. |
 | 37    | `toxin_resistance`     | Damage reduction from toxin exposure on polluted tiles.               |
-| 38    | `adaptation_rate`      | Speed of within-lifetime epigenetic-like modifier shifts. Not inherited. |
+| 38    | `adaptation_rate`      | Speed of within-lifetime epigenetic-like modifier shifts. Not inherited. Implemented as **thermal acclimation**: each tick a cell closes `adaptation_rate * max_adaptation_rate` of the gap between its effective temperature preference and its tile's temperature, and pays its mismatch cost against that acclimated preference. The shift lives on the cell and starts at zero in every newborn. |
 
 #### Social (4 genes)
 
@@ -108,7 +108,7 @@ The simulation is deterministic: identical seeds produce identical outcomes. Thi
 
 | Index | Gene                  | Description                                                             |
 |-------|-----------------------|-------------------------------------------------------------------------|
-| 43    | `gene_linkage`        | Controls which gene clusters tend to mutate together (simulates chromosomes). |
+| 43    | `gene_linkage`        | Controls which gene clusters tend to mutate together (simulates chromosomes). It redistributes the mutational load rather than adding to it: a linked block runs `1 / (1 - linkage)` bytes on average and the chance of starting one is divided by the same factor. |
 | 44    | `horizontal_transfer` | Probability of absorbing genes from consumed cells into own genome.     |
 | 45    | `transposon_rate`     | Rate of internal gene duplication and shuffling within the genome.      |
 
@@ -120,7 +120,7 @@ The simulation is deterministic: identical seeds produce identical outcomes. Thi
 
 **Phase resolution order:** slots are evaluated 0, 1, 2. First match wins. No match = default active state (no modifiers applied).
 
-Evolution can disable a slot by setting `trigger_threshold` to 0 or 255 depending on condition polarity.
+Evolution can disable a slot by setting `trigger_threshold` to its maximum: a threshold of 0 fires always, 255 effectively never.
 
 #### Phase Slot Layout (6 bytes)
 
@@ -155,7 +155,7 @@ Evolution can disable a slot by setting `trigger_threshold` to 0 or 255 dependin
 | 2     | ~25% of threshold    | Moderate commitment: foraging shift |
 | 3     | ~40% of threshold    | Strong commitment: dormancy         |
 
-Entry happens when the condition crosses the threshold. Exit requires crossing threshold + band. This prevents rapid phase flickering.
+Entry happens when the condition rises to the threshold. Exit requires it to fall a band *below* the threshold (`threshold * (1 - band)`), so a phase is sticky once entered. Every trigger condition is normalised so that higher = stronger, so a slot is effectively disabled by setting `trigger_threshold` above what the condition can ever reach, not by polarity.
 
 ---
 
@@ -163,9 +163,29 @@ Entry happens when the condition crosses the threshold. Exit requires crossing t
 
 Three mechanisms prevent convergence toward homogeneous "supercells."
 
+They are applied in this order, and the order is load-bearing:
+
+```
+normalize -> top-N gating -> antagonistic pairs -> physical caps
+```
+
+**Gating decides what the cell expresses at all; the pairs then trade off between
+the things it does express.** Running the pairs first couples two mechanisms that
+are supposed to be independent: a gene is cut by its partners, and then cut *again*
+by the falloff, because those cuts cost it its rank. `speed` sits in three pairs,
+more than any other gene, and under the old order it was gated in **99.8% of random
+genomes** — which closed both mobile niches, scavenging and predation, to every
+genome the world could roll. Only sessile strategies survived.
+
+It also means a gene the cell is not expressing exerts no antagonistic pressure,
+which is the physically coherent reading: armour a cell is not growing should not be
+slowing it down.
+
 #### 1. Metabolic Budget
 
-Every gene has an expression cost. Total expression cost = effective per-tick energy drain. Costs scale **superlinearly** (exponent 1.5-2.0): pushing a gene from 50% to 100% effectiveness costs disproportionately more than 0% to 50%.
+Every gene has an expression cost. Total expression cost = effective per-tick energy drain, scaled by `metabolic_cost_scale`. Costs scale **superlinearly** (exponent 1.5-2.0): pushing a gene from 50% to 100% effectiveness costs disproportionately more than 0% to 50%.
+
+The scale sets the absolute level of the whole economy, and the invariant below is what it must preserve: at the default (0.2 x 46 genes = 9.2 for a maxed genome) an all-max cell still drains far faster than `photo_max_income` (4.0), while a lean specialist pays well under 1.0.
 
 A cell with all genes maxed drains energy faster than any acquisition method can replenish.
 
@@ -199,12 +219,22 @@ Some genes are structurally capped by others:
 - `attack_range` <= `sense_radius` (can't hit what you can't see)
 - `territorial_radius` capped by `speed` (can't patrol unreachable area)
 - `offspring_scatter` capped by `sense_radius` (can't place offspring beyond perception)
+- `maturity_age` capped by `max_age` (`maturity_lifespan_fraction` of the cell's own lifespan) — a cell that matures after it dies is sterile by construction, and a whole founder lineage can be lost that way
 
 ---
 
 ### Visual Representation
 
-Cell color is derived from genome hash. Genetically similar cells appear visually similar. Speciation is visible as color clustering on the grid.
+Cell color is a continuous function of what the cell is, so genetically similar cells appear visually similar and speciation shows as color clustering:
+
+- **Hue band** from the dominant acquisition strategy (photosynthesis green, thermosynthesis ember, scavenging ochre, predation magenta, none slate).
+- **Hue within the band** (±22°) from the genome hash, so a lineage drifts gradually instead of jumping. A one-byte mutation moves hue ~15°; unrelated genomes sit ~77° apart.
+- **Saturation** from how specialized the cell is (the gap between its best acquisition gene and the runner-up).
+- **Brightness** from energy as a share of the cell's own storage cap, so starvation is visible.
+
+A plain hash-to-HSV mapping does *not* satisfy this: it moved hue ~88° for a single changed byte, which is indistinguishable from an unrelated genome.
+
+The renderer also offers debug modes that replace this mapping: flat color per strategy, flat color per active phase, and an energy heat ramp.
 
 ---
 
@@ -249,9 +279,11 @@ Top rows receive maximum energy, bottom rows receive minimal or zero. Photosynth
 
 Creates a "surface" zone where photosynthetic cells thrive.
 
+**Light is the one field that does not wrap.** The grid is toroidal on both axes (see Grid Properties), but each column's scan restarts at full intensity at `y = 0`, so the last row and the first row are neighbours in space and maximum-distance apart in light. That is intended, and it is what makes the vertical resource axis below a real axis rather than a ring: without it there would be no "top". The consequence is that a cell can step from the darkest row into the brightest one, and that the two producer niches — photic and thermal — border each other at the seam. Anything else that reasons about depth must therefore measure `y` from the bottom row *without* wrapping, the way `World::is_in_vent_zone` does; wrapping it put vent energy into the photic rows.
+
 #### Thermal Vents
 
-Localized high-energy sources positioned along the **bottom edge** of the grid. Fixed positions, finite output per tick shared among adjacent cells.
+Localized high-energy sources positioned along the **bottom edge** of the grid. Fixed positions, finite output per tick shared among every cell within `vent_radius` tiles. The radius is what makes the bottom zone a zone: at a radius of 1 a vent feeds nine tiles out of a quarter-million, and no founder cluster ever reached one.
 
 Can be configured as:
 - **Permanent:** constant output
@@ -266,9 +298,11 @@ The vertical resource axis:
 
 #### Decay Matter
 
-Dead cells leave behind an energy deposit on their tile. Deposit energy starts at a fraction of the cell's energy at death. Decays over time according to configurable `decay_rate`. Scavengers extract energy via `scavenge_ability`.
+Dead cells leave behind an energy deposit on their tile: `corpse_biomass` of structural matter plus `corpse_energy_fraction` of whatever energy remained. The structural part matters — a starved cell has no energy left but still has a body, and without it starvation deaths fed no one. With `corpses_keep_energy` this holds for every corpse: a cell that dies of old age leaves `corpse_energy_fraction` of the energy it still held (without the switch senescence zeroes that energy first, and an old corpse leaves only the biomass), and a killed cell's tile also receives whatever part of its pre-blow energy its killer did not absorb. Decays over time according to configurable `decay_rate`. Scavengers extract energy via `scavenge_ability`.
 
 Creates a nutrient cycle: predators kill, remains feed scavengers, scavengers die, new remains appear.
+
+The cycle has to be started. Nothing dies for the first several hundred ticks of a run -- `max_age` maps to a 300-3000 tick lifespan -- while a scavenger's runway is its storage cap over its upkeep, about 157 ticks. Scavengers seeded at tick 0 therefore starve before their food exists, measured with `decay_current` at 0.0 for the first ~70 ticks. `initial_decay_matter` puts pre-existing detritus on every tile at world creation so the niche exists from the start.
 
 ### Environmental Layers
 
@@ -336,8 +370,13 @@ Simultaneous resolution ensures no cell has an advantage from processing order. 
 | `sunlight_gradient_strength`    | Steepness of top-to-bottom energy falloff              |
 | `vent_count`                    | Number of thermal vents along bottom edge              |
 | `vent_output`                   | Energy emitted per vent per tick                       |
+| `vent_radius`                   | How far a vent's output reaches, in tiles              |
 | `vent_cycle`                    | Erupt/dormant period. 0 = always on                   |
 | `decay_rate`                    | Speed at which remains lose energy                     |
+| `initial_decay_matter`          | Detritus every tile starts with, so scavengers have food at tick 0 |
+| `max_scavenge_per_tick`         | Cap on decay one cell can strip from a tile in one tick |
+| `max_dormancy_trigger`          | Highest energy fraction a `dormancy_trigger` of 255 can mean |
+| `min_dormancy_cost`             | Floor on the metabolic discount `dormancy_cost` can buy |
 | `pheromone_decay`               | Pheromone evaporation speed                            |
 | `pheromone_diffusion`           | Pheromone spread rate to neighbors                     |
 | `toxin_decay`                   | Toxin cleanup speed                                    |
@@ -349,6 +388,36 @@ Simultaneous resolution ensures no cell has an advantage from processing order. 
 | `base_spawn_energy`             | Minimum starting energy for all spawned cells          |
 | `bonus_spawn_energy`            | Additional energy scaled by genome viability score     |
 | `cluster_count`                 | Number of clusters for random_clusters seeding strategy |
+| `archetype_band_depth`          | Rows per preset_archetypes band; 0 derives it from the band's population |
+| `archetype_population_shares`   | How initial_cell_count splits between the four archetypes |
+| `metabolic_cost_scale`          | Multiplier on the summed per-gene expression cost      |
+| `photo_max_income`              | Income of a perfect photosynthesizer in full sunlight   |
+| `scavenge_efficiency`           | Fraction of consumed decay matter that becomes energy   |
+| `energy_cap_floor`              | Storage capacity when `energy_storage_cap` is 0        |
+| `energy_cap_max`                | Storage capacity when `energy_storage_cap` is 255      |
+| `reproduction_energy_floor`     | Absolute energy required to split, whatever the cap    |
+| `min_offspring_energy_share`    | Least share of parent energy a child is born with       |
+| `max_offspring_energy_share`    | Most share of its energy a parent can give its child    |
+| `max_mutation_rate`             | Per-byte mutation chance when `mutation_rate` is 255    |
+| `max_mutation_magnitude`        | Largest byte shift when `mutation_magnitude` is 255     |
+| `max_adaptation_rate`           | Share of the temperature gap closed per tick at `adaptation_rate` 255 |
+| `max_move_distance`             | Furthest a move goes in one tick; 1 is one tile per tick |
+| `attack_only_when_harmful`      | Attack only a threat whose armour the blow can beat; otherwise flee |
+| `flee_can_escape`               | Flee takes a speed roll, only from threats that can hurt, and movement resolves before blows land |
+| `food_targets_richest`          | Steer toward the richest food in range rather than the nearest |
+| `foragers_stay_on_food`         | A cell on food moves less, by its chemotaxis times its own tile's share of the food around |
+| `max_transposon_rate`           | Chance per birth of a transposon event at `transposon_rate` 255 |
+| `max_horizontal_transfer`       | Chance per kill of absorbing a victim gene at `horizontal_transfer` 255 |
+| `corpse_decay_scale_min`        | Multiplier on `decay_rate` for a corpse whose `decay_rate` gene is 0 |
+| `corpse_decay_scale_max`        | Multiplier on `decay_rate` for a corpse whose `decay_rate` gene is 255 |
+| `min_lifespan_ticks`            | Lifespan when `max_age` is 0                            |
+| `max_lifespan_ticks`            | Lifespan when `max_age` is 255                          |
+| `max_maturity_ticks`            | Maturity delay when `maturity_age` is 255               |
+| `maturity_lifespan_fraction`    | Cap on maturity as a share of the cell's own lifespan   |
+| `corpse_biomass`                | Structural decay matter every corpse leaves behind      |
+| `corpse_energy_fraction`        | Share of a corpse's remaining energy that becomes decay |
+| `corpses_keep_energy`           | An old corpse keeps its energy, and a kill's uneaten part stays on the victim's tile |
+| `max_predation_efficiency`      | Share of a victim's energy a kill pays at `predation_efficiency` 255 |
 
 ### Initial Seeding Strategies
 
@@ -356,7 +425,7 @@ Simultaneous resolution ensures no cell has an advantage from processing order. 
 |---------------------|---------------------------------------------------------------------------------|
 | `random_uniform`    | Random genomes scattered uniformly. Chaotic start, slow convergence.            |
 | `random_clusters`   | Random genomes placed in spatial clusters. Each cluster shares a common ancestor. Immediate local competition + divergence between clusters. |
-| `preset_archetypes` | 3-4 hand-designed species (photosynthesizer, predator, scavenger, vent-feeder) with mutations. Controlled start. |
+| `preset_archetypes` | 4 hand-designed species (photosynthesizer, vent-feeder, scavenger, predator) with mutations. Controlled start: the trophic links are already in contact, so this measures whether a food web is *sustainable* here, separately from whether random founders ever assemble one. |
 
 Recommended default: `random_clusters` for the most interesting early dynamics.
 
@@ -366,9 +435,18 @@ Recommended default: `random_clusters` for the most interesting early dynamics.
 
 ### Genome Initialization (Biased Random)
 
-All 64 bytes are rolled uniformly random. After rolling, the four energy acquisition genes are checked: `photosynthesis_rate`, `thermosynthesis_rate`, `scavenge_ability`, and `predation_efficiency`. If none of these exceed the viability floor (`min_viable_acquisition`, default 40/255), the highest one is boosted to the floor.
+All 64 bytes are rolled uniformly random. After rolling, the four energy acquisition genes are checked: `photosynthesis_rate`, `thermosynthesis_rate`, `scavenge_ability`, and `predation_efficiency`. If none of them **expresses** above the viability floor (`min_viable_acquisition`, default 40/255), the genome is adjusted until one does.
 
-This guarantees every cell has at least one working energy acquisition method without prescribing which one. The choice emerges from the random roll -- a cell might be a photosynthesizer, a scavenger, or a predator depending on which gene happened to be highest before the floor was applied.
+The test is on the decoded value, not the raw byte. Checking the byte does not guarantee anything: top-N gating attenuates every gene outside a genome's dozen strongest, so an acquisition gene sitting exactly at the floor is routinely outranked by random parameter genes and decodes ten times smaller. Measured on the byte-only check, **41.7% of founders decoded below the floor** the check was supposed to guarantee.
+
+The adjustment tries each acquisition gene in descending raw order and, for each:
+
+- cuts the other three back to the floor, because `photosynthesis_rate` and `thermosynthesis_rate` are themselves an antagonistic pair — a roll that is high in both expresses neither (photo 255 with thermo 183 decodes to 0.392 before gating and 0.039 after);
+- raises the candidate until it decodes above the floor *and* ranks inside the top N.
+
+The first candidate that works is kept. Antagonistic pairs still cut the gene down afterwards, and they should: a genome that rolled a high `speed` cannot be a photosynthesizer, because the two are a pair — but it makes a perfectly good hunter, and that is which gene the search settles on.
+
+This guarantees every cell has at least one working energy acquisition method without prescribing which one. The choice emerges from the random roll -- a cell might be a photosynthesizer, a scavenger, or a predator depending on which gene happened to be highest, and on which one the rest of its genome will let it express.
 
 Phase table bytes are left fully random. Most newly-spawned cells will have nonsensical phase triggers. That is intentional -- evolution cleans up the phase table over many generations.
 
@@ -386,6 +464,8 @@ viability = max(effective_photosynthesis, effective_thermosynthesis,
 starting_energy = base_spawn_energy + (viability / max_viability) * bonus_spawn_energy
 ```
 
+Starting energy is clamped to the genome's own storage capacity: anything above the cap would be wasted on the first tick anyway.
+
 `base_spawn_energy` gives every cell a brief survival runway regardless of genome quality -- even a bad genome gets a few ticks to find food before starving. `bonus_spawn_energy` is the reward for efficiency: a well-built genome can start with 3-4x more energy than a poor one.
 
 This creates soft selection at spawn. Bad genomes are not killed immediately, but they have a much shorter runway to find food or reproduce. Both parameters are configurable.
@@ -394,7 +474,7 @@ This creates soft selection at spawn. Bad genomes are not killed immediately, bu
 
 When using `random_clusters`:
 
-- The grid is divided into `cluster_count` evenly-spaced positions using a grid layout (not random placement) to guarantee clusters do not overlap at spawn.
+- The grid is divided into `cluster_count` evenly-spaced positions using a grid layout (not random placement) to guarantee clusters do not overlap at spawn. Rows span the **full** Y axis, top and bottom edges included, so that some clusters really do start in the vent zone; centring each row inside its own band instead leaves every founder tens of tiles short of the bottom.
 - Each cluster position gets one **ancestor genome** generated via the biased random process above.
 - All other members of the cluster are copies of the ancestor with light mutation applied, using the ancestor's own `mutation_rate` and `mutation_magnitude` genes.
 - Cluster radius is `grid_width / (cluster_count * 2)`. Cells within a cluster are scattered randomly within this radius.
@@ -406,7 +486,72 @@ This means each cluster starts as a genetically similar population occupying the
 - No two cells may occupy the same tile at spawn.
 - `random_clusters`: cluster centers are placed on a regular grid layout to guarantee spacing. Cells within each cluster are placed at random positions within the cluster radius.
 - `random_uniform`: cells placed at random unique positions across the full grid.
-- `preset_archetypes`: predefined cluster centers, one per archetype, equal population per cluster.
+- `preset_archetypes`: one full-width band per archetype, stacked in contact (see below). Populations are split by `archetype_population_shares`, equal by default.
+
+### Archetype Bands (preset_archetypes Strategy)
+
+The four archetypes are hand-built rather than rolled: each carries the genes its
+strategy needs and leaves everything else near zero, so it clears its own upkeep in
+its own niche on tick 1. Phase tables are switched off (a `trigger_threshold` above
+what the condition can reach) except for one designed slot on the predator; the
+random strategies' founder phase noise is deliberate, and a controlled start should
+not also be measuring it. Mutation reopens the slots over a run.
+
+**The four designs, and why each is shaped the way it is** (the measurements behind
+each choice are in `docs/handover/HANDOVER.md`, step 12):
+
+- **Photosynthesizer and vent-feeder** -- sessile primary producers carrying enough
+  `armor` that a *sated* predator's blow does no damage.
+- **Scavenger** -- a sessile **mixotroph**: scavenging is its strongest channel, with
+  photosynthesis as a second income and a low reproduction threshold. A mobile, pure
+  detritivore cannot pay for its own search in this world (sense, chemotaxis and
+  speed are all expression cost, and corpses are intermittent); the scavengers that
+  evolve under random seeding are nearly sessile and photosynthesize too. Being
+  sessile, it pays nothing for armour (`armor <-> speed` only bites a mover).
+- **Predator** -- sustainable rather than a plague because of three brakes:
+  - *hunger*: its base `attack_power` does no damage through prey armour, and one
+    phase slot (EnergyLow, firing below ~25% of its cap) doubles its offense, so it
+    kills only when it needs to eat;
+  - *maturity*: a newborn cannot breed at once, otherwise every newborn goes
+    kill -> breed -> kill and breeding chains double every few ticks;
+  - *cooldown*: a mature predator breeds at most once per ~100 ticks, otherwise a
+    cohort that matures together breeds repeatedly at once.
+
+**`max_maturity_ticks` must be around 300 for this strategy.** Maturity is the brake
+that keeps newborn predators from breeding at once, and at a cap of 30 no gene can
+express it. The random strategies do as well or better at 30, so the default is not
+changed; `docs/handover/archetypes.json` is a ready-made config for this strategy.
+
+Each archetype gets a **full-width horizontal band**, and the bands stack around the
+`y` wrap seam, which is where this world's two energy sources meet: light enters at
+`y = 0` and is absorbed downward, while the vents sit on the bottom row.
+
+```text
+  y = 0            photosynthesizer   brightest rows, nothing above to shade them
+    (same rows)    scavenger          interleaved: a mixotroph needs the light, and
+                                      producers die where it stands
+  below it         predator           in contact with the producers it eats
+  ...
+  y = H - depth    vent-feeder        the vent row, adjacent to the photic band
+```
+
+Bands rather than square clusters, because of the light column. Every occupied tile
+absorbs 0.2 of the light passing through it, so a producer colony that is deep in `y`
+shades itself out: a 51x51 square block of founders measured a mean sunlight of 15.6
+of 255 on its own tiles. The same effect is why the scavenger shares the photic rows:
+in its own band beneath the photosynthesizers it earned 0.17 a tick against an upkeep
+of 0.88. Band depth is derived from each archetype's founder count (about half the
+tiles filled) and can be overridden with `archetype_band_depth`.
+
+`archetype_population_shares` splits `initial_cell_count` between the four, in the
+order photosynthesizer, vent-feeder, scavenger, predator. Equal shares are the
+default.
+
+**What this start achieves** (measured, `archetypes.json`): all four seeded lineages
+coexist to t = 4 000 on every seed tried, under both equal and pyramid shares, and to
+t = 8 000 on two seeds of three. The failure mode is evolutionary: over thousands of
+ticks predator numbers creep up, consistent with selection moving their hunger
+trigger toward greed, until they overshoot their prey.
 
 ### Spawn Position and Zone Interaction
 
@@ -422,6 +567,7 @@ This is intentional. Mismatched placement creates immediate directional selectio
 
 These are intentionally deferred from the initial implementation:
 
+- **Wider within-lifetime adaptation** -- `adaptation_rate` (gene 38) currently drives thermal acclimation only; other traits with a clear local target could shift the same way.
 - **Continuous phase blending** -- phase modifiers interpolate smoothly based on condition intensity instead of discrete switching
 - **Entropy-based specialization penalty** -- replace top-N gating with an entropy measure over gene distribution for smoother evolutionary gradients
 - **Day/night cycle** -- sinusoidal multiplier on sunlight gradient

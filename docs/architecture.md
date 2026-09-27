@@ -28,6 +28,19 @@ Cell {
 
 ~80 bytes per cell. 300K cells = ~24MB.
 
+#### Cell Records (instrumentation)
+
+Beside the pool, `World.records: Vec<CellRecord>` holds per-cell bookkeeping
+that no simulation rule reads: the founder `lineage` (inherited unchanged by
+every descendant), lifetime `income` per channel (photosynthesis, vent,
+scavenging, predation), lifetime `upkeep`, and the `death` cause once
+something has killed the cell. It is indexed like the pool and reset by
+`spawn_cell`, so a recycled id never inherits a dead cell's record. It lives
+outside `Cell` to keep the hot per-tick array small. `World.stats: TickStats`
+counts what happened in the current tick (actions chosen, births, deaths by
+cause, attacks and kills, energy flows, phase transitions, per-phase wall
+time) and is reset at the top of every tick. See `sim/stats.rs`.
+
 ### Grid (Double-Buffered)
 
 Two flat arrays of tiles. All cells read from "current" to make decisions. All writes go to "next." After the tick, swap pointers and clear "next."
@@ -69,8 +82,9 @@ src/
   sim/
     mod.rs           -- Simulation struct, public API: new(), step(), snapshot()
     genome.rs        -- Genome struct, gene index constants, decode(),
-                        mutate(), expression pipeline (antagonistic pairs,
-                        top-N gating, phase modifiers -> effective stats)
+                        mutate(), expression pipeline (top-N gating, then
+                        antagonistic pairs, then physical caps; phase
+                        modifiers are applied after decode -> effective stats)
     cell.rs          -- Cell struct, per-cell state
     world.rs         -- World struct: grid buffers, cell pool, free list,
                         environment layers, spatial queries
@@ -84,16 +98,25 @@ src/
                         modifier computation
     energy.rs        -- Energy income (photo/thermo/scavenge),
                         metabolic drain, starvation
-    spawner.rs       -- Initial seeding strategies, cell creation
+    spawner.rs       -- Initial seeding strategies, cell creation,
+                        inject() for introducing cells mid-run (lab)
+    stats.rs         -- Instrumentation: TickStats, CellRecord, DeathCause;
+                        written by the sim, read only by observers
 
   render/
     mod.rs           -- Renderer struct: takes WorldSnapshot,
                         produces pixel buffer
     color.rs         -- Genome-to-color mapping
 
-  config.rs          -- WorldConfig struct (serde), loaded from JSON
-  main.rs            -- Entry point: parse config, spawn threads,
+  config.rs          -- WorldConfig struct (serde), loaded from JSON;
+                        fields a file leaves out take their defaults
+  lib.rs             -- Library root: config, render, sim
+  main.rs            -- Window binary: parse config, spawn threads,
                         window event loop
+  bin/lab/           -- Headless measurement harness (`cargo run --release
+                        --bin lab`): per-interval reports, multi-seed
+                        scorecard with paired arms, invasion-from-rare
+                        assay, archetype/niche/colour tools
 ```
 
 ---
@@ -127,7 +150,9 @@ Strategy: triple-buffer or `arc-swap`. The sim writes to a back buffer, atomical
 ```
 WorldSnapshot {
     tick: u64
-    cells: Vec<(u16, u16, GenomeHash)>   // position + color data
+    cells: Vec<CellView>                  // position, genome hash, strategy,
+                                          // specialization, energy and age
+                                          // fractions, active phase
     // optional overlay data:
     decay_map: Vec<f32>
     pheromone_map: Vec<f32>
@@ -166,7 +191,7 @@ For each living cell:
 ### Phase 3: Decision
 
 For each living cell:
-- Compute effective stats (raw genome -> antagonistic pairs -> top-N gating -> phase modifiers)
+- Compute effective stats (raw genome -> top-N gating -> antagonistic pairs -> physical caps -> phase modifiers). Action resolution and vent income recompute the same phase-modified values, so a phase applies to what a cell *does*, not only to what it decided.
 - Select action using hardcoded priority: **Reproduce > Attack > Flee > Move > Idle**
 - Each action has a gate condition (e.g., reproduce only if energy > threshold and cooldown expired and target tile exists). First passing action wins.
 - Record chosen action and target in an action buffer
@@ -176,8 +201,9 @@ For each living cell:
 Process all actions simultaneously against the current grid, writing results to the next grid:
 
 - **Movement conflicts:** if two cells target the same tile, highest `rigidity` wins. Loser stays in place.
-- **Attack resolution:** simultaneous damage exchange. Both attacker and defender take/deal damage in the same tick.
-- **Reproduction:** child placed only if target tile is empty in the next grid. Parent and child energy split according to `offspring_energy_share`.
+- **Order:** Reproduce, then Attack, then Flee/Move, then Share, then Idle. With `flee_can_escape`, Flee/Move resolve before Attack, and a blow whose target has moved beyond the attacker's `attack_range` misses (`TickStats::attacks_missed`); otherwise the attack pass places the defender first and an attacked cell cannot move.
+- **Attack resolution:** simultaneous damage exchange. Both attacker and defender take/deal damage in the same tick. If the defender dies, the attacker absorbs `predation_efficiency * max_predation_efficiency` of the victim's pre-blow energy; with `corpses_keep_energy` the rest is laid on the victim's tile as decay.
+- **Reproduction:** child placed only if target tile is empty in the next grid. Parent and child energy split according to `offspring_energy_share`, bounded to `[min_offspring_energy_share, max_offspring_energy_share]` so neither leaves the split dead.
 - **Resource sharing:** energy transferred to adjacent kin. Capped by donor's current energy.
 
 ### Phase 5: Energy Update
@@ -186,15 +212,16 @@ For each living cell in the next grid:
 - Add photosynthesis income (based on local sunlight and effective `photosynthesis_rate`)
 - Add thermosynthesis income (based on vent proximity and effective `thermosynthesis_rate`)
 - Add scavenge income (based on tile decay matter and effective `scavenge_ability`)
-- Subtract metabolic cost (base + expression cost from active genes)
+- Subtract metabolic cost (summed per-gene expression cost x `metabolic_cost_scale`, plus the temperature-mismatch penalty)
 - Apply venom tick damage if poisoned
 - Apply toxin damage if on toxic tile (reduced by `toxin_resistance` and `membrane`)
-- Cap energy at `energy_storage_cap`
+- If age >= the cell's lifespan (from `max_age`): mark dead of old age; with `corpses_keep_energy`, lay `corpse_energy_fraction` of the energy it held on its tile
+- Cap energy at the cell's storage capacity (`energy_cap_floor` + gene share of the range to `energy_cap_max`)
 - If energy <= 0: mark dead
 
 ### Phase 6: Cleanup
 
-- Dead cells become decay matter on their tile (energy deposit = fraction of cell's energy at death)
+- Dead cells become decay matter on their tile (`corpse_biomass` + `corpse_energy_fraction` of any energy left)
 - Generate toxin if deaths exceed `toxin_generation_threshold` in a local area
 - Return dead cell indices to the free list
 - Write pheromone contributions from living cells with `signal_emission`
@@ -210,10 +237,10 @@ Hardcoded priority order, evaluated top to bottom. First action whose gate condi
 
 | Priority | Action    | Gate condition                                                                 |
 |----------|-----------|--------------------------------------------------------------------------------|
-| 1        | Reproduce | energy > reproduction_threshold AND cooldown expired AND empty adjacent tile exists AND age >= maturity_age |
+| 1        | Reproduce | energy > max(reproduction_threshold, `reproduction_energy_floor`) AND cooldown expired AND empty adjacent tile exists AND age >= maturity_age |
 | 2        | Attack    | hostile target within attack_range (genetic distance > aggression_trigger)     |
-| 3        | Flee      | threat detected AND flee_response > 0 AND escape tile available               |
-| 4        | Move      | speed check passes (random < speed/255) AND destination tile available         |
+| 3        | Flee      | threat detected AND flee_response > 0 AND escape tile available. With `flee_can_escape`: a threat whose blow beats this cell's armour or whose venom gets through its membrane, AND random < speed * flee_response, AND escape tile available |
+| 4        | Move      | speed check passes (random < speed/255, scaled by 1 - adhesion x kin share; with `foragers_stay_on_food` also by 1 - chemotaxis x own-tile food share) AND destination tile available |
 | 5        | Share     | kin adjacent AND resource_sharing check passes AND own energy above threshold  |
 | 6        | Idle      | always passes (fallback)                                                       |
 
@@ -233,6 +260,7 @@ WorldConfig {
     sunlight_gradient_strength: f32
     vent_count: u32
     vent_output: f32
+    vent_radius: u32                // tiles a vent's output reaches
     vent_cycle: (u32, u32)          // (active_ticks, dormant_ticks)
 
     // Diffusion
@@ -244,15 +272,57 @@ WorldConfig {
 
     // Decay
     decay_rate: f32
+    initial_decay_matter: f32       // detritus on every tile at world creation
+    corpse_decay_scale_min: f32
+    corpse_decay_scale_max: f32
 
     // Temperature
     temperature_noise_scale: f32
     temperature_mismatch_cost: f32
 
+    // Heredity
+    max_mutation_rate: f32          // per-byte mutation chance at gene = 255
+    max_mutation_magnitude: u8
+    max_transposon_rate: f32
+    max_adaptation_rate: f32        // thermal acclimation per tick at adaptation_rate 255
+    max_move_distance: u32          // tiles per move; 1 = the spec's one tile per tick
+    attack_only_when_harmful: bool
+    flee_can_escape: bool           // flee rolls speed, only from real threats; moves resolve before blows
+    food_targets_richest: bool
+    foragers_stay_on_food: bool     // a cell on food moves less, by chemotaxis x own-tile food share
+    max_horizontal_transfer: f32      // largest byte shift at gene = 255
+
+    // Lifecycle
+    max_dormancy_trigger: f32
+    min_dormancy_cost: f32
+    min_lifespan_ticks: u32         // lifespan at max_age = 0
+    max_lifespan_ticks: u32         // lifespan at max_age = 255
+    max_maturity_ticks: u32         // maturity at maturity_age = 255
+    maturity_lifespan_fraction: f32 // maturity is capped at this share of lifespan
+
+    // Corpses
+    corpse_biomass: f32             // structural matter every corpse leaves
+    corpse_energy_fraction: f32     // share of remaining energy that becomes decay
+    corpses_keep_energy: bool       // old corpses keep their energy; a kill's uneaten part becomes decay
+
+    // Predation
+    max_predation_efficiency: f32   // share of victim energy a kill pays at gene = 255
+
     // Expression constraints
     top_n_gene_count: u32
     top_n_falloff: f32
     metabolic_cost_exponent: f32
+    metabolic_cost_scale: f32       // multiplier on summed expression cost
+
+    // Energy economy
+    photo_max_income: f32           // income of a perfect photosynthesizer in full sun
+    scavenge_efficiency: f32        // fraction of consumed decay that becomes energy
+    max_scavenge_per_tick: f32      // cap on decay stripped from one tile per tick
+    energy_cap_floor: f32           // storage cap when energy_storage_cap gene = 0
+    energy_cap_max: f32             // storage cap when energy_storage_cap gene = 1
+    reproduction_energy_floor: f32  // absolute energy needed to split, whatever the cap
+    min_offspring_energy_share: f32 // least share of parent energy a child gets
+    max_offspring_energy_share: f32 // most share a parent can give away
 
     // Seeding
     initial_cell_count: u32
@@ -261,6 +331,8 @@ WorldConfig {
     base_spawn_energy: f32
     bonus_spawn_energy: f32
     cluster_count: u32
+    archetype_band_depth: u32       // rows per preset_archetypes band; 0 = derive from population
+    archetype_population_shares: [f32; 4]  // photo / vent-feeder / scavenger / predator
     seed: u64
 
     // Simulation
@@ -280,13 +352,14 @@ Loaded from a JSON file at startup via `serde`. Immutable during a simulation ru
 4. Background tiles can optionally show environment overlays (sunlight gradient, temperature, pheromone heatmap)
 5. Framebuffer is presented via the `pixels` crate to the window surface
 
-Cell color is derived from a hash of the genome. The hash should be stable across mutations (small mutation = small color shift) so that lineages are visually trackable as gradual color drift.
+Cell color comes from `render::color::cell_to_rgba(&CellView, ColorMode)`. A hash alone is not stable across mutations, so the mapping is strategy hue + bounded per-genome drift + energy brightness (see `docs/spec.md`, Visual Representation). `ColorMode` switches the view between `Genetic`, `Strategy`, `Phase` and `Energy`.
 
 ---
 
 ## Determinism Guarantees
 
-- All RNG uses a seeded `StdRng` (seed from config)
+- All RNG uses a seeded `ChaCha8Rng` (seed from config), including the lab's mid-run `inject`
+- Instrumentation (`TickStats`, `CellRecord`) is write-only from the simulation's point of view: no rule branches on it. `TickStats::phase_ns` is wall-clock time and is the one non-deterministic field
 - Tick resolution is simultaneous (double-buffered), eliminating iteration order effects
 - Floating point operations use consistent ordering (no parallel reductions with nondeterministic accumulation)
 - Same config + same seed = identical simulation at any tick count
