@@ -1,0 +1,10 @@
+[project]
+name = "Primordium"
+languages = ["rust"]
+roots = ["src"]
+
+[modules]
+"src/bin/lab/**" = "Lab"
+"src/render/**" = "Render"
+"src/sim/**" = "Sim"
+"src/*" = "Primordium"

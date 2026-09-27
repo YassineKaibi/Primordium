@@ -1,0 +1,1 @@
+{"key":"v1\u001frust:63013947763f77b3\u001fsrc/render/mod.rs\u001fRender\u001fsrc\u001f\u001fpub mod color;\n\n// Renderer struct: takes WorldSnapshot, produces pixel buffer\n","facts":{"decls":[],"calls":[],"imports":[],"touches":[],"mods":[{"name":"color","inline":false}]}}
