@@ -1,3 +1,10 @@
+// @veridikt
+// kind: module
+// name: Cell
+// purpose: "The per-cell record: genome plus the mutable runtime state (energy, age, phase, cooldowns, venom, damage memory) that the tick reads and writes"
+// owner: "primordium-maintainers"
+// because: "Cell is a plain data struct held in World's pool; all behavior lives in the sim phases, keeping the hot per-tick array compact (~80 bytes/cell, docs/architecture.md)"
+
 use crate::sim::genome::Genome;
 
 /// A living cell in the simulation. Stored in the cell pool (Vec<Cell>).
@@ -22,6 +29,15 @@ pub struct Cell {
     pub last_damage_tick: u32,
     /// Remembered direction from sensing (persists for `memory_length` ticks)
     pub memory_dir: (i8, i8),
+    /// Ticks `memory_dir` still counts for. Refreshed to the cell's
+    /// `memory_length` on every move and counted down otherwise, so
+    /// `docs/spec.md` gene 25's "0 = purely reactive" is literally true.
+    pub memory_ticks: u8,
+    /// Within-lifetime shift of this cell's effective temperature preference,
+    /// driven by `adaptation_rate` (`docs/spec.md` gene 38). Starts at zero in
+    /// every cell, so it is never inherited: a child begins again from the
+    /// preference its genome encodes.
+    pub temp_acclimation: f32,
 }
 
 impl Cell {
@@ -40,10 +56,16 @@ impl Cell {
             venom_damage: 0,
             last_damage_tick: 0,
             memory_dir: (0, 0),
+            memory_ticks: 0,
+            temp_acclimation: 0.0,
         }
     }
 
     /// A cell is alive when its energy is positive.
+
+    // @veridikt
+    // purpose: "Liveness predicate used everywhere to skip/cull cells: alive iff energy > 0"
+    // because: "Death is defined purely by energy reaching zero, so starvation, combat, venom and toxin all funnel through the same single check"
     #[inline]
     pub fn is_alive(&self) -> bool {
         self.energy > 0.0

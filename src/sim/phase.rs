@@ -1,3 +1,10 @@
+// @veridikt
+// kind: module
+// name: Phase
+// purpose: "Conditional phase expression: pick which of a genome's 3 phase slots is active from environmental triggers, with hysteresis, and scale gene groups accordingly"
+// owner: "primordium-maintainers"
+// because: "Phases let one genome behave differently by context (e.g. flee when wounded, hibernate when starving) without new genes — a cheap source of conditional, switchable behavior for selection to exploit"
+
 // Phase evaluation, hysteresis tracking, modifier computation
 
 use crate::sim::genome::{
@@ -100,6 +107,10 @@ pub struct PhaseInput {
 /// Returns 0 for default (no phase active), or 1-3 for the matching slot.
 /// Implements hysteresis: entering requires crossing the threshold,
 /// exiting requires crossing threshold + band.
+
+// @veridikt
+// purpose: "Decide the cell's active phase this tick: return the first slot (1-3) whose trigger condition clears its threshold, else 0 (default)"
+// because: "Hysteresis is asymmetric on purpose — entering needs the full threshold but exiting only needs to fall below threshold*(1-band) — so cells don't flicker between phases at the boundary"
 pub fn evaluate_phase(genome: &Genome, input: &PhaseInput, current_phase: u8) -> u8 {
     for slot in 0..PHASE_SLOT_COUNT {
         let condition =
@@ -129,6 +140,10 @@ pub fn evaluate_phase(genome: &Genome, input: &PhaseInput, current_phase: u8) ->
 
 /// Map a trigger condition + cell state to a 0.0..1.0 strength value
 /// that can be compared against the decoded threshold.
+
+// @veridikt
+// purpose: "Map each trigger condition + current sense data to a 0..1 strength comparable against a slot threshold"
+// because: "Count-based triggers (threat/kin/crowded) are normalized by sensed area via a saturating ratio, so the same raw count means more to a short-sighted cell than a far-seeing one"
 fn condition_strength(condition: &TriggerCondition, input: &PhaseInput) -> f32 {
     match condition {
         TriggerCondition::EnergyLow => 1.0 - input.energy_fraction,
@@ -189,6 +204,10 @@ const EFFICIENCY_GENES: [usize; 4] = [0, 1, 3, 23];
 /// - 255 → gene scaled to ~200% (full boost), clamped to 1.0
 ///
 /// If `phase_slot` is 0, no modifiers are applied (default phase).
+
+// @veridikt
+// purpose: "Rescale offense/defense/mobility/efficiency gene groups by the active slot's four modifier bytes (128 = neutral), mutating the decoded genes in place"
+// because: "Modifiers act on gene GROUPS, not single genes, so one phase byte can e.g. boost all offense at once — keeping the phase encoding compact (6 bytes/slot) while still expressive"
 pub fn apply_phase_modifiers(genes: &mut DecodedGenes, genome: &Genome, phase_slot: u8) {
     if phase_slot == 0 {
         return;
@@ -222,6 +241,123 @@ fn apply_modifier(values: &mut [f32; BASE_GENE_COUNT], gene_indices: &[usize], m
 mod tests {
     use super::*;
     use crate::sim::genome::{GENOME_LEN, Genome};
+
+    /// Does a phase slot actually buy a lineage anything?
+    ///
+    /// Section 5 of the handover left this open: B7 proved the modifiers
+    /// *reach* action resolution, but not that carrying a slot is worth
+    /// anything. Comparing against "no slot" would only prove a free buff is
+    /// free, so both lineages here carry the **same** slot with the **same**
+    /// modifier and differ in one byte: the trigger condition. One fires when
+    /// the cell is short of energy, which is when a photosynthesis boost is
+    /// worth having; the other fires only when it is already near full, a
+    /// state this lineage's reproduction cycle never reaches.
+    ///
+    /// Two things had to be got right before the comparison measured
+    /// anything, and both are worth keeping in mind for any future one:
+    ///
+    /// - **Separate worlds.** Run interleaved in one world, a control with
+    ///   two phenotypically identical lineages still split 423 / 609 — holding
+    ///   a column is a compounding positional advantage, and the artefact was
+    ///   the same size as the effect being measured (399 / 631).
+    /// - **Growth rate, not endpoint, and a gene with headroom.** Measured at
+    ///   a fixed tick both lineages sat at carrying capacity (1032 vs 1030),
+    ///   and with `photosynthesis_rate` already decoding near 1.0 the boost
+    ///   clamped to +2% anyway. `apply_modifier` clamps at 1.0, so a phase
+    ///   can only pay where the base gene has room to grow into.
+    #[test]
+    fn a_well_matched_phase_trigger_grows_faster_than_a_wasted_one() {
+        use crate::config::WorldConfig;
+        use crate::sim::cell::Cell;
+        use crate::sim::genome::{self, PHASE_SLOT_COUNT, PHASE_SLOT_SIZE};
+        use crate::sim::tick::run_tick;
+        use crate::sim::world::World;
+        use rand::SeedableRng;
+        use rand_chacha::ChaCha8Rng;
+
+        let config = WorldConfig {
+            grid_width: 48,
+            grid_height: 48,
+            vent_count: 0,
+            ..WorldConfig::default()
+        };
+
+        let base = {
+            let mut d = [6u8; GENOME_LEN];
+            // Deliberately mid-range: a maxed gene has nowhere to go, since
+            // apply_modifier clamps at 1.0.
+            d[genome::PHOTOSYNTHESIS_RATE] = 120;
+            d[genome::SPEED] = 0;
+            d[genome::FLEE_RESPONSE] = 0;
+            d[genome::ENERGY_STORAGE_CAP] = 200;
+            d[genome::REPRODUCTION_THRESHOLD] = 130;
+            d[genome::OFFSPRING_ENERGY_SHARE] = 128;
+            d[genome::MAX_AGE] = 96;
+            d[genome::MATURITY_AGE] = 10;
+            d[genome::TEMPERATURE_PREFERENCE] = 128;
+            d[genome::AGGRESSION_TRIGGER] = 200;
+            // Heredity off: this compares two fixed genomes, not their drift.
+            d[genome::MUTATION_RATE] = 0;
+            d[genome::TRANSPOSON_RATE] = 0;
+            d[genome::DORMANCY_TRIGGER] = 0;
+            for slot in 0..PHASE_SLOT_COUNT {
+                let b = genome::BASE_GENE_COUNT + slot * PHASE_SLOT_SIZE;
+                d[b + PHASE_TRIGGER_CONDITION] = 2; // ThreatNearby, unreachable
+                d[b + PHASE_TRIGGER_THRESHOLD] = 252;
+                d[b + PHASE_OFFENSE_MOD] = 128;
+                d[b + PHASE_DEFENSE_MOD] = 128;
+                d[b + PHASE_MOBILITY_MOD] = 128;
+                d[b + PHASE_EFFICIENCY_MOD] = 128;
+            }
+            let b = genome::BASE_GENE_COUNT;
+            d[b + PHASE_TRIGGER_THRESHOLD] = 152; // ~0.60, no hysteresis
+            d[b + PHASE_EFFICIENCY_MOD] = 200; // +56% on the efficiency group
+            d
+        };
+
+        let mut timely = base;
+        timely[genome::BASE_GENE_COUNT + PHASE_TRIGGER_CONDITION] =
+            TriggerCondition::EnergyLow as u8;
+        let mut wasted = base;
+        wasted[genome::BASE_GENE_COUNT + PHASE_TRIGGER_CONDITION] =
+            TriggerCondition::EnergyHigh as u8;
+
+        // Ticks to reach a target population, which is a growth rate and so
+        // is not flattened by the carrying capacity both lineages share.
+        let ticks_to_reach = |data: [u8; GENOME_LEN], target: u32| {
+            let mut world = World::new(&config);
+            for y in 10..14u16 {
+                for x in 0..20u16 {
+                    let id = world.spawn_cell(Cell::new(Genome::new(data), 40.0, (x, y)));
+                    world.set_current_tile_cell_id(x, y, id);
+                }
+            }
+            let mut rng = ChaCha8Rng::seed_from_u64(4);
+            for t in 1..=1200u32 {
+                run_tick(&mut world, &config, &mut rng);
+                if world.population() >= target {
+                    return t;
+                }
+            }
+            println!(
+                "  (never reached {target}; ended at {})",
+                world.population()
+            );
+            u32::MAX
+        };
+
+        let (a, b) = (ticks_to_reach(timely, 250), ticks_to_reach(wasted, 250));
+        println!("PHASEFIT timely={a} ticks, wasted={b} ticks");
+        assert!(
+            a < u32::MAX,
+            "the well-matched lineage never reached the target"
+        );
+        assert!(
+            a < b,
+            "the well-matched trigger took {a} ticks to reach 250 against {b} for the \
+             wasted one — a phase slot buys the lineage nothing"
+        );
+    }
 
     #[test]
     fn trigger_condition_from_byte_direct() {

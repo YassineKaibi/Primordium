@@ -1,9 +1,18 @@
+// @veridikt
+// kind: module
+// name: Actions
+// purpose: "What a cell perceives and does: sensing, the priority-gated action choice, and the simultaneous resolution of all cells' actions into the next grid"
+// owner: "primordium-maintainers"
+// because: "decide() is pure and buffered, then resolve_all applies everything in strict global priority order (reproduce>attack>move>share>idle) so the tick is order-independent and deterministic"
+// depends_on: World, Genome, Stats
+
 // Action enum (Move, Attack, Reproduce, Share, Idle),
 // decision logic, conflict resolution
 
 use crate::config::WorldConfig;
 use crate::sim::cell::Cell;
-use crate::sim::genome::{self, BASE_GENE_COUNT, DecodedGenes, Genome};
+use crate::sim::genome::{self, BASE_GENE_COUNT, DecodeCache, DecodedGenes, Genome};
+use crate::sim::stats::{self, DeathCause};
 use crate::sim::world::{Tile, World};
 
 // ── Action enum ────────────────────────────────────────────────────
@@ -23,6 +32,21 @@ pub enum Action {
     Share(u32),
     /// Do nothing this tick.
     Idle,
+}
+
+impl Action {
+    /// Position in the priority order Reproduce > Attack > Flee > Move >
+    /// Share > Idle, as `TickStats::actions` indexes it.
+    pub fn priority_index(self) -> usize {
+        match self {
+            Action::Reproduce(..) => 0,
+            Action::Attack(_) => 1,
+            Action::Flee(..) => 2,
+            Action::Move(..) => 3,
+            Action::Share(_) => 4,
+            Action::Idle => 5,
+        }
+    }
 }
 
 // ── TileSnapshot ───────────────────────────────────────────────────
@@ -53,6 +77,10 @@ impl TileSnapshot {
 // ── Genetic distance ───────────────────────────────────────────────
 
 /// Manhattan distance over the 46 base genes, normalized to 0.0-1.0.
+
+// @veridikt
+// purpose: "Normalized genetic difference between two genomes; the raw signal behind kin-vs-threat classification"
+// because: "Kin recognition compares this distance against an aggression threshold scaled by KIN_RECOGNITION_PRECISION, so 'who is family' is itself an evolvable, fuzzy judgement"
 pub fn genetic_distance(a: &Genome, b: &Genome) -> f32 {
     let sum: u32 = (0..BASE_GENE_COUNT)
         .map(|i| (a.gene(i) as i16 - b.gene(i) as i16).unsigned_abs() as u32)
@@ -60,7 +88,32 @@ pub fn genetic_distance(a: &Genome, b: &Genome) -> f32 {
     sum as f32 / (BASE_GENE_COUNT as f32 * 255.0)
 }
 
+/// The 8 unit headings, in the order `SenseResult::free_run` is indexed.
+pub const HEADINGS: [(i32, i32); 8] = [
+    (-1, -1),
+    (0, -1),
+    (1, -1),
+    (-1, 0),
+    (1, 0),
+    (-1, 1),
+    (0, 1),
+    (1, 1),
+];
+
 // ── SenseResult ────────────────────────────────────────────────────
+
+/// A non-kin neighbour and the weapons it would strike with, so the Flee
+/// gate can tell a threat that can hurt the cell from one that cannot.
+#[derive(Debug, Clone, Copy)]
+pub struct Threat {
+    pub pos: (u16, u16),
+    pub cell_id: u32,
+    /// Chebyshev distance from the sensing cell.
+    pub dist: u16,
+    /// Decoded, phase-modified `attack_power` and `venom`.
+    pub attack_power: f32,
+    pub venom: f32,
+}
 
 /// Aggregated sensing data for one cell's neighborhood scan.
 pub struct SenseResult {
@@ -84,19 +137,57 @@ pub struct SenseResult {
     pub local_tile: TileSnapshot,
     /// Empty tiles within radius 1 (for placement actions).
     pub empty_adjacent: Vec<(u16, u16)>,
+    /// Empty tiles within the cell's `offspring_scatter` reach, for
+    /// placing a child. `docs/spec.md` gene 22: "distance from parent at
+    /// which offspring spawns", capped by `sense_radius`. Always a superset
+    /// of `empty_adjacent`.
+    pub empty_scatter: Vec<(u16, u16)>,
+    /// For each of the 8 headings in `HEADINGS`, how many consecutive empty
+    /// tiles lie in that direction (up to the sense radius). A multi-tile move
+    /// can only travel as far as the run is clear.
+    pub free_run: [u8; 8],
+    /// Decoded, phase-modified armour of `nearest_threat`, scaled to damage
+    /// units (x255). Only filled when `attack_only_when_harmful` is on.
+    pub nearest_threat_armor: f32,
+    /// Every non-kin neighbour with its weapons, in scan order. Only filled
+    /// when `flee_can_escape` is on.
+    pub threats: Vec<Threat>,
+    /// The cell's own tile's share of the food around it, 0..1: its food
+    /// value over that plus the richest other food tile in sense range. 1 is
+    /// a meal with nothing comparable in sight, 0.5 a tile no better than the
+    /// best one nearby, 0 no food underfoot. Always 0 for a hunter.
+    pub own_food_share: f32,
+    /// Grid dimensions, so headings can use toroidal deltas.
+    pub world_size: (u32, u32),
 }
 
 // ── Gene value mapping helpers ─────────────────────────────────────
 
-/// Map reproduction_threshold gene to absolute energy value.
-fn mapped_reproduction_threshold(genes: &DecodedGenes) -> f32 {
-    let energy_cap = genes.get(genome::ENERGY_STORAGE_CAP) * 255.0;
-    genes.get(genome::REPRODUCTION_THRESHOLD) * energy_cap
+/// Energy a cell must hold before it may reproduce: its own threshold gene
+/// applied to its storage cap, but never below `reproduction_energy_floor`.
+///
+/// The floor is what stops a small-cap cell from splitting at near-zero
+/// energy and filling the grid with children too poor to survive a tick.
+pub fn mapped_reproduction_threshold(genes: &DecodedGenes, config: &WorldConfig) -> f32 {
+    let cap = crate::sim::energy::storage_cap(genes, config);
+    (genes.get(genome::REPRODUCTION_THRESHOLD) * cap).max(config.reproduction_energy_floor)
 }
 
-/// Map maturity_age gene to tick count.
-fn mapped_maturity_age(genes: &DecodedGenes) -> u32 {
-    (genes.get(genome::MATURITY_AGE) * 1000.0) as u32
+/// Ticks before a cell may reproduce, capped at a fraction of its own
+/// lifespan.
+///
+/// Without the cap a lineage whose `maturity_age` outruns its `max_age` is
+/// sterile by construction and dies out whatever the environment does. This
+/// is the same kind of physical cap as `attack_range` <= `sense_radius`.
+
+// @veridikt
+// purpose: "Map the maturity_age gene to ticks and clamp it below the cell's own lifespan"
+// depends_on: Energy.lifespan_ticks
+pub fn mapped_maturity_age(genes: &DecodedGenes, config: &WorldConfig) -> u32 {
+    let raw = (genes.get(genome::MATURITY_AGE) * config.max_maturity_ticks as f32) as u32;
+    let lifespan = crate::sim::energy::lifespan_ticks(genes, config);
+    let ceiling = (lifespan as f32 * config.maturity_lifespan_fraction) as u32;
+    raw.min(ceiling)
 }
 
 /// Map attack_range gene to tile distance (1-3).
@@ -105,8 +196,51 @@ fn mapped_attack_range(genes: &DecodedGenes) -> u16 {
     raw.max(1)
 }
 
+/// Map territorial_radius to tiles, 0 (defends nothing) up to the cell's own
+/// sense radius — it cannot defend what it cannot see.
+///
+/// `decode` has already capped the gene by `speed` (Physical Caps: "can't
+/// patrol unreachable area").
+fn mapped_territorial_radius(genes: &DecodedGenes) -> i32 {
+    let reach = mapped_sense_radius(genes) as f32;
+    (genes.get(genome::TERRITORIAL_RADIUS) * reach).round() as i32
+}
+
+/// Map offspring_scatter to a placement radius in tiles, 1 up to the cell's
+/// own sense radius.
+///
+/// `decode` has already capped the gene by `sense_radius` (Physical Caps),
+/// so this only has to turn it into tiles.
+fn mapped_offspring_scatter(genes: &DecodedGenes) -> i32 {
+    let reach = mapped_sense_radius(genes) as f32;
+    ((genes.get(genome::OFFSPRING_SCATTER) * reach).ceil() as i32).max(1)
+}
+
+/// Share of the parent's energy its child is born with: the
+/// `offspring_energy_share` gene, bounded to
+/// `[min_offspring_energy_share, max_offspring_energy_share]`.
+///
+/// Unbounded, a gene decoding to 0 made a child with no energy (a birth, a
+/// death at cleanup, and `corpse_biomass` of decay from nothing), and one
+/// decoding to 1 left the parent dead in childbirth. Bounding only the exact
+/// ends is not enough: a child born with 1% of a parent at the reproduction
+/// floor still starves in the tick it is born, and 0.7-2.4% of all births did.
+/// Inside the bounds the gene is used as it is.
+
+// @veridikt
+// purpose: "Bound the offspring_energy_share gene so both child and parent leave a birth alive"
+// because: "Out-of-range shares turned births into corpses: a zero-energy child still left corpse_biomass of decay, energy from nothing, and a share of 1 killed the parent; a clamp leaves every in-range genome untouched"
+pub fn offspring_energy_share(genes: &DecodedGenes, config: &WorldConfig) -> f32 {
+    // max-then-min rather than `clamp`, which panics on a config whose
+    // bounds cross; the ceiling wins then.
+    genes
+        .get(genome::OFFSPRING_ENERGY_SHARE)
+        .max(config.min_offspring_energy_share)
+        .min(config.max_offspring_energy_share)
+}
+
 /// Map reproduction_cooldown gene to tick count.
-fn mapped_reproduction_cooldown(genes: &DecodedGenes) -> u16 {
+pub fn mapped_reproduction_cooldown(genes: &DecodedGenes) -> u16 {
     (genes.get(genome::REPRODUCTION_COOLDOWN) * 100.0) as u16
 }
 
@@ -116,45 +250,110 @@ fn mapped_reproduction_cooldown(genes: &DecodedGenes) -> u16 {
 ///
 /// Priority: Reproduce > Attack > Flee > Move > Share > Idle.
 /// First passing gate wins.
+
+// @veridikt
+// purpose: "Choose one action for a cell this tick by walking fixed priority gates and taking the first that passes"
+// because: "Priority is hardcoded (survival/reproduction beats movement beats altruism) but every gate's condition is gene-driven, so which gate a cell can actually reach is still under genetic control"
+// assumes: "genes are already decoded + phase-modified; rng is the seeded stream so tie-breaks and exploratory moves stay reproducible"
 pub fn decide(
     cell: &Cell,
     genes: &DecodedGenes,
     sense: &SenseResult,
+    config: &WorldConfig,
     rng: &mut impl rand::Rng,
 ) -> Action {
+    // Gate 0: Dormancy. spec.md gene 34 calls this "the dormancy phase" —
+    // a cell below its own dormancy_trigger shuts down. `dormancy_cost`
+    // buys it a cheaper metabolism in `energy::update_energy`, and the price
+    // is paid here: it does nothing at all, so it cannot reproduce, hunt or
+    // flee until income lifts it back above the trigger. Without that price
+    // a low dormancy_cost would simply make starvation optional.
+    let cap = crate::sim::energy::storage_cap(genes, config);
+    let energy_fraction = if cap > 0.0 { cell.energy / cap } else { 0.0 };
+    if crate::sim::energy::dormancy_multiplier(genes, energy_fraction, config) < 1.0 {
+        return Action::Idle;
+    }
+
     // Gate 1: Reproduce
-    let repro_threshold = mapped_reproduction_threshold(genes);
-    let maturity = mapped_maturity_age(genes);
-    if cell.energy > repro_threshold
+    let repro_threshold = mapped_reproduction_threshold(genes, config);
+    let maturity = mapped_maturity_age(genes, config);
+    // >= not >: energy is clipped at the storage cap, so a cell whose
+    // threshold gene sits at 1.0 would otherwise never qualify.
+    if cell.energy >= repro_threshold
         && cell.cooldown_remaining == 0
         && cell.age >= maturity
-        && !sense.empty_adjacent.is_empty()
+        && !sense.empty_scatter.is_empty()
     {
-        let idx = rng.gen_range(0..sense.empty_adjacent.len());
-        let (tx, ty) = sense.empty_adjacent[idx];
+        let idx = rng.gen_range(0..sense.empty_scatter.len());
+        let (tx, ty) = sense.empty_scatter[idx];
         return Action::Reproduce(tx, ty);
     }
 
     // Gate 2: Attack
     let attack_range = mapped_attack_range(genes);
+    // With `attack_only_when_harmful`, a blow that cannot get through the
+    // target's armour is not an attack at all, and the threat falls through
+    // to the Flee gate — otherwise harmless prey "fights" an adjacent
+    // predator instead of running.
+    let can_hurt = !config.attack_only_when_harmful
+        || genes.get(genome::ATTACK_POWER) * 255.0 > sense.nearest_threat_armor;
     if let Some((_tx, _ty, target_id, dist)) = sense.nearest_threat
         && dist <= attack_range
+        && can_hurt
     {
         return Action::Attack(target_id);
     }
 
-    // Gate 3: Flee
-    if sense.nearest_threat.is_some()
-        && genes.get(genome::FLEE_RESPONSE) > 0.0
-        && let Some(flee_tile) = flee_direction(cell, sense)
+    // Gate 3: Flee. With `flee_can_escape` a flight is a move, so it takes
+    // the speed to make it (`speed * flee_response`), and a cell only runs
+    // from a threat that can actually hurt it (docs/spec.md gene 10: "away
+    // from larger or aggressive neighbors"). Without it, any non-kin in sight
+    // sends a cell with any flee_response at all running, every tick.
+    let flee_from = if config.flee_can_escape {
+        nearest_danger(genes, sense)
+            .filter(|_| {
+                rng.r#gen::<f32>() < genes.get(genome::SPEED) * genes.get(genome::FLEE_RESPONSE)
+            })
+            .map(|t| t.pos)
+    } else {
+        sense
+            .nearest_threat
+            .filter(|_| genes.get(genome::FLEE_RESPONSE) > 0.0)
+            .map(|(x, y, _, _)| (x, y))
+    };
+    if let Some(threat) = flee_from
+        && let Some(flee_tile) = flee_direction(cell, threat, sense)
     {
-        return Action::Flee(flee_tile.0, flee_tile.1);
+        let (fx, fy) = extend_move(cell.position, flee_tile, genes, sense, config);
+        return Action::Flee(fx, fy);
     }
 
     // Gate 4: Move
-    if rng.r#gen::<f32>() < genes.get(genome::SPEED)
-        && let Some((mx, my)) = compute_move_target(cell, genes, sense, rng)
+    // Adhesion sticks a cell to its neighbouring kin (spec.md gene 28,
+    // "tendency to stick to adjacent genetically similar cells. Enables
+    // cluster formation"). The gene was never read, so nothing held a
+    // colony together. It scales down the chance of moving in proportion to
+    // how much of the neighbourhood is kin.
+    let kin_share = if sense.neighbor_count > 0 {
+        sense.kin_count as f32 / sense.neighbor_count as f32
+    } else {
+        0.0
+    };
+    let stickiness = genes.get(genome::ADHESION) * kin_share;
+    let mut move_chance = genes.get(genome::SPEED) * (1.0 - stickiness);
+    // With `foragers_stay_on_food` a cell standing on food is held there by
+    // its own chemotaxis (spec.md gene 9, "tendency to move toward nearby
+    // energy sources": the nearest source is the one underfoot). Without it a
+    // mobile scavenger walks off a corpse worth eight meals on its speed roll,
+    // steered by chemotaxis toward the nearest *other* food tile, since the
+    // food scan skips its own.
+    if config.foragers_stay_on_food {
+        move_chance *= 1.0 - genes.get(genome::CHEMOTAXIS_STRENGTH) * sense.own_food_share;
+    }
+    if rng.r#gen::<f32>() < move_chance
+        && let Some(step) = compute_move_target(cell, genes, sense, rng)
     {
+        let (mx, my) = extend_move(cell.position, step, genes, sense, config);
         return Action::Move(mx, my);
     }
 
@@ -170,28 +369,57 @@ pub fn decide(
     Action::Idle
 }
 
-/// Find the flee direction: opposite vector from nearest threat, resolved to an adjacent tile.
-fn flee_direction(cell: &Cell, sense: &SenseResult) -> Option<(u16, u16)> {
-    let (tx, ty, _, _) = sense.nearest_threat?;
-    let (cx, cy) = cell.position;
-    // Vector from threat to cell (away from threat)
-    let dx = cx as i32 - tx as i32;
-    let dy = cy as i32 - ty as i32;
-    // Normalize to -1, 0, 1
-    let ndx = dx.signum();
-    let ndy = dy.signum();
+/// The nearest non-kin neighbour whose blow or venom would actually cost
+/// this cell energy — judged by the same exchange `resolve_attack` settles,
+/// against the cell's own armour and membrane.
 
-    // Check if opposite-direction adjacent tile is empty
-    let _target = (cx as i32 + ndx, cy as i32 + ndy);
-    // Find this in empty_adjacent (they're already wrapped)
-    // We need to check if any empty adjacent tile is in the flee direction
+// @veridikt
+// purpose: "Pick the nearest threat that could hurt this cell, by running each threat's weapons through resolve_attack against the cell's armour and membrane"
+// because: "Every non-kin counts as a threat for sensing, but running from one that cannot get through the armour only costs the cell its tick; venom counts because it lands whatever the armour"
+fn nearest_danger<'a>(genes: &DecodedGenes, sense: &'a SenseResult) -> Option<&'a Threat> {
+    let me = CombatStats {
+        cell_id: 0,
+        attack_power: genes.get(genome::ATTACK_POWER),
+        armor: genes.get(genome::ARMOR),
+        venom: genes.get(genome::VENOM),
+    };
+    let membrane = genes.get(genome::MEMBRANE);
+    let mut nearest: Option<&Threat> = None;
+    for t in &sense.threats {
+        let them = CombatStats {
+            cell_id: t.cell_id,
+            attack_power: t.attack_power,
+            armor: 0.0,
+            venom: t.venom,
+        };
+        let blow = resolve_attack(&them, &me);
+        let venom_hurts = blow.venom_ticks > 0
+            && crate::sim::energy::venom_tick_damage(blow.venom_damage, membrane) > 0.0;
+        if (blow.damage_to_defender > 0.0 || venom_hurts) && nearest.is_none_or(|n| t.dist < n.dist)
+        {
+            nearest = Some(t);
+        }
+    }
+    nearest
+}
+
+/// Find the flee direction: opposite vector from the threat at `(tx, ty)`,
+/// resolved to an adjacent tile.
+fn flee_direction(cell: &Cell, (tx, ty): (u16, u16), sense: &SenseResult) -> Option<(u16, u16)> {
+    let (cx, cy) = cell.position;
+    let (width, height) = sense.world_size;
+    // Away from the threat, along the shortest toroidal path.
+    let ndx = -toroidal_delta(cx, tx, width).signum();
+    let ndy = -toroidal_delta(cy, ty, height).signum();
+
+    // Find an empty adjacent tile in that direction (already wrapped).
     sense
         .empty_adjacent
         .iter()
         .copied()
         .find(|&(ex, ey)| {
-            let edx = (ex as i32 - cx as i32).signum();
-            let edy = (ey as i32 - cy as i32).signum();
+            let edx = toroidal_delta(cx, ex, width).signum();
+            let edy = toroidal_delta(cy, ey, height).signum();
             edx == ndx && edy == ndy
         })
         .or_else(|| {
@@ -210,6 +438,22 @@ fn find_adjacent_kin(sense: &SenseResult) -> Option<u32> {
 /// Combines five heading influences (direction_bias, noise, chemotaxis,
 /// pack_affinity, memory_dir) into a vector, then picks the empty adjacent
 /// tile most aligned with that heading via dot product.
+
+// @veridikt
+// purpose: "Pick the move target by summing five gene-weighted heading influences into one vector and choosing the best-aligned empty neighbor"
+// because: "Blending bias, noise, chemotaxis, pack pull, and remembered direction into a single heading lets complex movement (hunting gradients, swarming) emerge from a few scalar genes rather than explicit behavior code"
+/// Add `weight` worth of the direction (dx, dy) to a heading.
+///
+/// Normalising matters: a food tile four steps away must not outvote a
+/// neighbour one step away just because its delta is longer.
+fn add_unit(hx: &mut f32, hy: &mut f32, dx: f32, dy: f32, weight: f32) {
+    let len = (dx * dx + dy * dy).sqrt();
+    if len > f32::EPSILON && weight != 0.0 {
+        *hx += dx / len * weight;
+        *hy += dy / len * weight;
+    }
+}
+
 fn compute_move_target(
     cell: &Cell,
     genes: &DecodedGenes,
@@ -223,7 +467,9 @@ fn compute_move_target(
     // 1. Base heading from direction_bias + noise perturbation
     let direction_bias = genes.get(genome::DIRECTION_BIAS);
     let direction_noise = genes.get(genome::DIRECTION_NOISE);
-    let noise_angle = rng.r#gen::<f32>() * direction_noise * std::f32::consts::PI;
+    // Symmetric: a one-sided [0, noise*PI) term rotated every heading the
+    // same way, curving every path and drifting whole colonies.
+    let noise_angle = (rng.r#gen::<f32>() * 2.0 - 1.0) * direction_noise * std::f32::consts::PI;
     let angle = direction_bias * 2.0 * std::f32::consts::PI;
     let combined_angle = angle + noise_angle;
 
@@ -231,25 +477,88 @@ fn compute_move_target(
     let mut hy = combined_angle.sin();
 
     // 2. Chemotaxis: pull toward pheromone gradient
-    let chemotaxis = genes.get(genome::CHEMOTAXIS_STRENGTH);
-    hx += sense.pheromone_gradient.0 as f32 * chemotaxis;
-    hy += sense.pheromone_gradient.1 as f32 * chemotaxis;
-
     let cx = cell.position.0;
     let cy = cell.position.1;
+    let (width, height) = sense.world_size;
+
+    // Chemotaxis: toward the nearest energy source, per docs/spec.md gene 9.
+    // This used to be spent on the pheromone gradient while `nearest_food`
+    // went unread, so no cell ever moved toward food.
+    // sense_priority splits attention between the two: spec.md gene 24,
+    // "0 = food, 255 = threats. Gradient." The gene was never read, so every
+    // cell foraged with equal disregard for what was hunting it.
+    let priority = genes.get(genome::SENSE_PRIORITY);
+    let chemotaxis = genes.get(genome::CHEMOTAXIS_STRENGTH);
+    if let Some((fx, fy)) = sense.nearest_food {
+        let (dx, dy) = (
+            toroidal_delta(cx, fx, width) as f32,
+            toroidal_delta(cy, fy, height) as f32,
+        );
+        add_unit(&mut hx, &mut hy, dx, dy, chemotaxis * (1.0 - priority));
+    }
+    // The threat half: steer away from what the cell is watching. This is
+    // not the Flee gate (which is a separate, higher-priority action); it is
+    // the standing bias of a cell that watches threats over food.
+    //
+    // Unless the intruder is inside the cell's own territory, in which case
+    // it steers *toward* it: spec.md gene 41, territorial_radius, "radius of
+    // area the cell defends. Attacks non-kin who enter." The gene was never
+    // read, so nothing was ever defended.
+    if let Some((tx, ty, _, threat_dist)) = sense.nearest_threat {
+        let (dx, dy) = (
+            toroidal_delta(cx, tx, width) as f32,
+            toroidal_delta(cy, ty, height) as f32,
+        );
+        let territory = mapped_territorial_radius(genes);
+        if threat_dist as i32 <= territory {
+            add_unit(
+                &mut hx,
+                &mut hy,
+                dx,
+                dy,
+                genes.get(genome::TERRITORIAL_RADIUS),
+            );
+        } else {
+            add_unit(&mut hx, &mut hy, -dx, -dy, chemotaxis * priority);
+        }
+    }
+
+    // Pheromone is a separate sense; the gradient is already weighted by
+    // signal_sensitivity in `sense`.
+    add_unit(
+        &mut hx,
+        &mut hy,
+        sense.pheromone_gradient.0 as f32,
+        sense.pheromone_gradient.1 as f32,
+        1.0,
+    );
 
     // 3. Pack affinity: pull toward nearest kin
     if let Some(nearest_kin) = sense.nearest_kin
         && nearest_kin.2 != 0
     {
         let pack = genes.get(genome::PACK_AFFINITY);
-        hx += (nearest_kin.0 as f32 - cx as f32) * pack;
-        hy += (nearest_kin.1 as f32 - cy as f32) * pack;
+        let (dx, dy) = (
+            toroidal_delta(cx, nearest_kin.0, width) as f32,
+            toroidal_delta(cy, nearest_kin.1, height) as f32,
+        );
+        add_unit(&mut hx, &mut hy, dx, dy, pack);
     }
 
-    // 4. Memory: momentum from previous tick direction
-    hx += cell.memory_dir.0 as f32 * 0.5;
-    hy += cell.memory_dir.1 as f32 * 0.5;
+    // 4. Memory: momentum from the last step this cell took, weighted by
+    // memory_length. The field was never written, so this term was always
+    // zero and gene 25 did nothing ("0 = purely reactive" was true of every
+    // cell). `memory_ticks` is what makes the gene a *duration*.
+    if cell.memory_dir != (0, 0) {
+        let memory = genes.get(genome::MEMORY_LENGTH);
+        add_unit(
+            &mut hx,
+            &mut hy,
+            cell.memory_dir.0 as f32,
+            cell.memory_dir.1 as f32,
+            memory,
+        );
+    }
 
     // 5. Zero-vector fallback: pick random tile
     if hx.abs() < f32::EPSILON && hy.abs() < f32::EPSILON {
@@ -262,8 +571,8 @@ fn compute_move_target(
     let mut best_score = f32::NEG_INFINITY;
 
     for &(tx, ty) in &sense.empty_adjacent {
-        let dx = tx as f32 - cx as f32;
-        let dy = ty as f32 - cy as f32;
+        let dx = toroidal_delta(cx, tx, width) as f32;
+        let dy = toroidal_delta(cy, ty, height) as f32;
         let score = dx * hx + dy * hy;
         if score > best_score {
             best_score = score;
@@ -285,7 +594,33 @@ fn mapped_sense_radius(genes: &DecodedGenes) -> u16 {
 /// Scan the neighborhood around a cell and build a SenseResult.
 ///
 /// Pure function — no RNG. Classification uses scaled thresholds.
-pub fn sense(cell: &Cell, genes: &DecodedGenes, world: &World) -> SenseResult {
+
+// @veridikt
+// purpose: "Scan a cell's neighborhood into a SenseResult: nearest food/threat/kin, counts, pheromone gradient, its own tile's share of the food around, and empty adjacent tiles for placement"
+// triggers: Actions.sense_cached
+// because: "What counts as 'food' depends on the cell's strongest acquisition gene (decay for scavengers, bright tiles for photosynthesizers, vent-proximity for thermosynthesizers), so each cell senses the resource it can actually use"
+pub fn sense(
+    cell: &Cell,
+    genes: &DecodedGenes,
+    world: &World,
+    config: &WorldConfig,
+) -> SenseResult {
+    sense_cached(cell, genes, world, config, &mut DecodeCache::default())
+}
+
+/// `sense`, decoding neighbours through this tick's cache. Only
+/// `flee_can_escape` decodes neighbours, to read their weapons.
+
+// @veridikt
+// purpose: "sense() with the tick's decode cache, which the Flee gate's threat list needs to read every non-kin neighbour's weapons"
+// triggers: World.neighbors_in_radius, Genome.DecodeCache, Phase.apply_phase_modifiers
+pub fn sense_cached(
+    cell: &Cell,
+    genes: &DecodedGenes,
+    world: &World,
+    config: &WorldConfig,
+    cache: &mut DecodeCache,
+) -> SenseResult {
     let (cx, cy) = cell.position;
     let radius = mapped_sense_radius(genes);
 
@@ -293,8 +628,12 @@ pub fn sense(cell: &Cell, genes: &DecodedGenes, world: &World) -> SenseResult {
 
     // Kin recognition: precision scales the effective aggression trigger.
     // Low precision widens the "hostile" band.
-    let precision = genes.get(genome::KIN_RECOGNITION_PRECISION);
-    let aggression = genes.get(genome::AGGRESSION_TRIGGER);
+    // Read straight from the genome, not the decoded genes: top-N gating
+    // attenuates whatever is not in a cell's dozen strongest genes, and a
+    // gated threshold of ~0.05 classified even siblings (distance ~0.13) as
+    // threats. Recognition is a threshold, not an expressed capability.
+    let precision = cell.genome.gene(genome::KIN_RECOGNITION_PRECISION) as f32 / 255.0;
+    let aggression = cell.genome.gene(genome::AGGRESSION_TRIGGER) as f32 / 255.0;
     let effective_trigger = aggression * (0.5 + 0.5 * precision);
 
     // Determine which acquisition gene is strongest (for food detection).
@@ -306,6 +645,9 @@ pub fn sense(cell: &Cell, genes: &DecodedGenes, world: &World) -> SenseResult {
 
     let mut nearest_food: Option<(u16, u16)> = None;
     let mut nearest_food_dist = i32::MAX;
+    let mut best_food_value = f32::NEG_INFINITY;
+    // The most food on any one tile in range, for `own_food_share`.
+    let mut richest_food = 0.0_f32;
     let mut nearest_threat: Option<(u16, u16, u32, u16)> = None;
     let mut nearest_threat_dist = i32::MAX;
     let mut nearest_kin: Option<(u16, u16, u32)> = None;
@@ -313,6 +655,7 @@ pub fn sense(cell: &Cell, genes: &DecodedGenes, world: &World) -> SenseResult {
     let mut kin_count: u32 = 0;
     let mut threat_count: u32 = 0;
     let mut neighbor_count: u32 = 0;
+    let mut threats: Vec<Threat> = Vec::new();
     let mut food_nearby = false;
 
     // Pheromone gradient tracking
@@ -337,6 +680,21 @@ pub fn sense(cell: &Cell, genes: &DecodedGenes, world: &World) -> SenseResult {
             if tile_dist < nearest_threat_dist {
                 nearest_threat_dist = tile_dist;
                 nearest_threat = Some((nx, ny, cell_id, tile_dist as u16));
+            }
+            if config.flee_can_escape {
+                let mut t = cache.get(cell_id, &neighbor_cell.genome, config).clone();
+                crate::sim::phase::apply_phase_modifiers(
+                    &mut t,
+                    &neighbor_cell.genome,
+                    neighbor_cell.active_phase,
+                );
+                threats.push(Threat {
+                    pos: (nx, ny),
+                    cell_id,
+                    dist: tile_dist as u16,
+                    attack_power: t.get(genome::ATTACK_POWER),
+                    venom: t.get(genome::VENOM),
+                });
             }
         }
     }
@@ -364,14 +722,32 @@ pub fn sense(cell: &Cell, genes: &DecodedGenes, world: &World) -> SenseResult {
                 tile.sunlight > 128
             } else {
                 // Thermo: check vent proximity (bottom row, near vent x positions)
-                is_near_vent(wx, wy, world)
+                is_near_vent(wx, wy, world, config.vent_radius)
             };
 
             if is_food {
                 food_nearby = true;
                 let tile_dist = toroidal_dist(cx, cy, wx, wy, world.width, world.height);
-                if tile_dist < nearest_food_dist {
+                // How much food is here, for `food_targets_richest`. Vents are
+                // all-or-nothing, so for a thermosynthesizer every vent tile
+                // scores the same and distance decides.
+                let value = if scavenge >= photo && scavenge >= thermo {
+                    tile.decay_energy
+                } else if photo >= thermo {
+                    tile.sunlight as f32
+                } else {
+                    1.0
+                };
+                richest_food = richest_food.max(value);
+                let better = if config.food_targets_richest {
+                    value > best_food_value
+                        || (value == best_food_value && tile_dist < nearest_food_dist)
+                } else {
+                    tile_dist < nearest_food_dist
+                };
+                if better {
                     nearest_food_dist = tile_dist;
+                    best_food_value = value;
                     nearest_food = Some((wx, wy));
                 }
             }
@@ -384,13 +760,46 @@ pub fn sense(cell: &Cell, genes: &DecodedGenes, world: &World) -> SenseResult {
     } else if photo >= thermo {
         local_tile.sunlight > 128
     } else {
-        is_near_vent(cx, cy, world)
+        is_near_vent(cx, cy, world, config.vent_radius)
     };
     if own_is_food {
         food_nearby = true;
     }
+    // How much of the food around is under the cell itself: its own tile
+    // against the richest other tile in range, on the same scale the food
+    // scan uses. A predator's food is prey, which is never underfoot.
+    let own_food = if !own_is_food {
+        0.0
+    } else if scavenge >= photo && scavenge >= thermo {
+        local_tile.decay_energy
+    } else if photo >= thermo {
+        local_tile.sunlight as f32
+    } else {
+        1.0
+    };
+    let hunts = {
+        let predation = genes.get(genome::PREDATION_EFFICIENCY);
+        predation >= photo && predation >= thermo && predation >= scavenge
+    };
+    let own_food_share = if hunts || own_food <= 0.0 {
+        0.0
+    } else {
+        own_food / (own_food + richest_food)
+    };
 
     // Scale pheromone gradient by signal_sensitivity
+    // A predator's food is prey, not a tile. Without this a hunter has no
+    // food target at all and wanders while prey stands next to it.
+    let predation = genes.get(genome::PREDATION_EFFICIENCY);
+    if predation >= photo
+        && predation >= thermo
+        && predation >= scavenge
+        && let Some((tx, ty, _, _)) = nearest_threat
+    {
+        nearest_food = Some((tx, ty));
+        food_nearby = true;
+    }
+
     let sensitivity = genes.get(genome::SIGNAL_SENSITIVITY);
     let pheromone_gradient = if best_pheromone > 0.0 && sensitivity > 0.0 {
         (
@@ -401,19 +810,54 @@ pub fn sense(cell: &Cell, genes: &DecodedGenes, world: &World) -> SenseResult {
         (0, 0)
     };
 
-    // Collect empty adjacent tiles (radius 1 only, for placement actions)
+    // Empty tiles for placement. `empty_adjacent` is radius 1, used by
+    // movement and flee; `empty_scatter` reaches as far as the cell's
+    // offspring_scatter gene allows, which is how a lineage disperses
+    // instead of only ever budding into the tile next door.
+    let scatter = mapped_offspring_scatter(genes);
     let mut empty_adjacent = Vec::new();
-    for dy in -1..=1_i32 {
-        for dx in -1..=1_i32 {
+    let mut empty_scatter = Vec::new();
+    for dy in -scatter..=scatter {
+        for dx in -scatter..=scatter {
             if dx == 0 && dy == 0 {
                 continue;
             }
             let (wx, wy) = world.wrap(cx as i32 + dx, cy as i32 + dy);
-            if world.current_tile(wx, wy).cell_id == 0 {
+            if world.current_tile(wx, wy).cell_id != 0 {
+                continue;
+            }
+            empty_scatter.push((wx, wy));
+            if dx.abs() <= 1 && dy.abs() <= 1 {
                 empty_adjacent.push((wx, wy));
             }
         }
     }
+
+    // How far each heading is clear, for moves longer than one tile. Only
+    // worth walking when a move can actually go further than one tile.
+    let mut free_run = [0u8; 8];
+    let reach = (config.max_move_distance as i32).min(radius as i32).max(1);
+    for (run, &(hx, hy)) in free_run.iter_mut().zip(HEADINGS.iter()) {
+        for step in 1..=reach {
+            let (wx, wy) = world.wrap(cx as i32 + hx * step, cy as i32 + hy * step);
+            if world.current_tile(wx, wy).cell_id != 0 {
+                break;
+            }
+            *run = step as u8;
+        }
+    }
+
+    // What the nearest threat's armour would absorb, so `decide` can tell a
+    // blow that lands from a harmless one.
+    let nearest_threat_armor = match nearest_threat {
+        Some((_, _, id, _)) if config.attack_only_when_harmful => {
+            let target = world.get_cell(id);
+            let mut t = target.genome.decode(config);
+            crate::sim::phase::apply_phase_modifiers(&mut t, &target.genome, target.active_phase);
+            t.get(genome::ARMOR) * 255.0
+        }
+        _ => 0.0,
+    };
 
     SenseResult {
         nearest_food,
@@ -426,19 +870,53 @@ pub fn sense(cell: &Cell, genes: &DecodedGenes, world: &World) -> SenseResult {
         food_nearby,
         local_tile,
         empty_adjacent,
+        empty_scatter,
+        free_run,
+        nearest_threat_armor,
+        threats,
+        own_food_share,
+        world_size: (world.width, world.height),
     }
 }
 
-/// Check if a tile is near a thermal vent (within 1 tile of a vent on the bottom row).
-fn is_near_vent(x: u16, y: u16, world: &World) -> bool {
-    let bottom = world.height - 1;
-    if (y as u32) < bottom.saturating_sub(1) {
-        return false;
+/// Stretch a one-tile step from `from` to `to` along the same heading, as far
+/// as `config.max_move_distance`, the mover's speed and the clear run allow.
+///
+/// `docs/spec.md` gene 6 keeps `speed` as the chance of moving at all; this is
+/// how far the move goes once it happens: `max(1, round(speed * max))` tiles,
+/// never through an occupied tile and never beyond the sense radius (a cell
+/// cannot aim at what it cannot see — the same physical cap as
+/// `attack_range <= sense_radius`).
+
+// @veridikt
+// purpose: "Extend a chosen one-tile move to a multi-tile move along the same heading, bounded by speed, max_move_distance, the clear run and the sense radius"
+// because: "With one tile per tick as a hard ceiling, a forager could never cover the ground between intermittent food sources; spec.md keeps speed as a probability, so distance is a separate, configurable reach"
+fn extend_move(
+    from: (u16, u16),
+    to: (u16, u16),
+    genes: &DecodedGenes,
+    sense: &SenseResult,
+    config: &WorldConfig,
+) -> (u16, u16) {
+    if config.max_move_distance <= 1 {
+        return to;
     }
-    world
-        .vent_positions
-        .iter()
-        .any(|&vx| (x as i32 - vx as i32).unsigned_abs() <= 1)
+    let (w, h) = sense.world_size;
+    let dx = toroidal_delta(from.0, to.0, w).signum();
+    let dy = toroidal_delta(from.1, to.1, h).signum();
+    let Some(dir) = HEADINGS.iter().position(|&hd| hd == (dx, dy)) else {
+        return to;
+    };
+    let wanted = (genes.get(genome::SPEED) * config.max_move_distance as f32).round() as i32;
+    let steps = wanted.max(1).min(sense.free_run[dir] as i32).max(1);
+    let x = (from.0 as i32 + dx * steps).rem_euclid(w as i32) as u16;
+    let y = (from.1 as i32 + dy * steps).rem_euclid(h as i32) as u16;
+    (x, y)
+}
+
+/// Check if a tile is near a thermal vent (within 1 tile of a vent on the bottom row).
+fn is_near_vent(x: u16, y: u16, world: &World, radius: u32) -> bool {
+    world.is_in_vent_zone(x, y, radius)
 }
 
 /// Chebyshev distance on a toroidal grid.
@@ -452,6 +930,16 @@ fn toroidal_dist(x1: u16, y1: u16, x2: u16, y2: u16, width: u32, height: u32) ->
         d.min(height as i32 - d)
     };
     dx.max(dy)
+}
+
+/// Signed shortest-path delta from `from` to `to` on one toroidal axis.
+///
+/// At the seam the raw difference is `n - 1` where the real step is `-1`,
+/// so headings and flee vectors must use this, never `to - from`.
+fn toroidal_delta(from: u16, to: u16, n: u32) -> i32 {
+    let n = n as i32;
+    let d = (to as i32 - from as i32).rem_euclid(n);
+    if d > n / 2 { d - n } else { d }
 }
 
 // ── Movement conflict resolution ──────────────────────────────────
@@ -482,6 +970,10 @@ pub enum MoveOutcome {
 /// highest rigidity wins. Returns a list of outcomes (winners and losers).
 ///
 /// Ties in rigidity are broken by cell_id (lower id wins) for determinism.
+
+// @veridikt
+// purpose: "Arbitrate cells that want the same tile: highest rigidity wins it, everyone else stays put"
+// because: "Ties break on lower cell_id, not iteration order, so the outcome is deterministic regardless of how the intents were collected"
 pub fn resolve_movement_conflicts(intents: &[MoveIntent]) -> Vec<MoveOutcome> {
     use std::collections::HashMap;
 
@@ -556,6 +1048,10 @@ pub struct AttackOutcome {
 /// Defender retaliates: `defender.attack_power * 255 - attacker.armor * 255`, minimum 0.
 /// Venom: if `attacker.venom > 0`, defender gets `venom_ticks = (venom * 10) as u8`
 /// and `venom_damage = (venom * 25) as u8`.
+
+// @veridikt
+// purpose: "Compute the outcome of one attack: simultaneous armor-reduced damage both ways, plus venom-over-time applied to the defender"
+// because: "The defender always retaliates in the same exchange, so attacking an armored/strong cell can cost the aggressor more than it gains — aggression is not free"
 pub fn resolve_attack(attacker: &CombatStats, defender: &CombatStats) -> AttackOutcome {
     AttackOutcome {
         damage_to_defender: (attacker.attack_power * 255.0 - defender.armor * 255.0).max(0.0),
@@ -581,20 +1077,27 @@ pub struct ReproductionOutcome {
 /// Resolve a reproduction action: clone genome, mutate, split energy, set cooldown.
 ///
 /// - Child genome = parent genome cloned + `mutate()` applied
-/// - Child energy = `parent_energy * offspring_energy_share`
+/// - Child energy = `parent_energy * offspring_energy_share`, the share
+///   bounded by `offspring_energy_share()` so neither side leaves dead
 /// - Parent energy is reduced by child's energy
 /// - Parent cooldown set from `reproduction_cooldown` gene
 /// - Child is a fresh Cell at `target_pos` with age 0, no venom, no cooldown
+
+// @veridikt
+// purpose: "Produce a mutated child by cloning the parent genome, splitting off a share of the parent's energy, and setting the parent's cooldown"
+// triggers: Genome.mutate, Actions.offspring_energy_share
+// because: "Child energy is taken from the parent (offspring_energy_share, bounded by config), so reproduction is a real cost and over-reproducing can starve a lineage — births are paid for, not free"
 pub fn resolve_reproduction(
     parent: &Cell,
     genes: &DecodedGenes,
     target_pos: (u16, u16),
+    config: &WorldConfig,
     rng: &mut impl rand::Rng,
 ) -> ReproductionOutcome {
     let mut child_genome = parent.genome.clone();
-    child_genome.mutate(rng);
+    child_genome.mutate(config, rng);
 
-    let child_energy = parent.energy * genes.get(genome::OFFSPRING_ENERGY_SHARE);
+    let child_energy = parent.energy * offspring_energy_share(genes, config);
     let child = Cell::new(child_genome, child_energy, target_pos);
     let parent_energy = parent.energy - child_energy;
 
@@ -620,6 +1123,10 @@ pub struct ShareOutcome {
 ///
 /// Transfer amount = `resource_sharing * donor_energy * 0.1`, capped so
 /// donor doesn't go below zero.
+
+// @veridikt
+// purpose: "Move a fraction of the donor's energy to a kin recipient, scaled by the donor's resource_sharing gene"
+// because: "Altruism is gated on kin recognition upstream, so sharing flows toward relatives — the mechanism that lets photosynthesizer/swarm colonies pool energy instead of competing"
 pub fn resolve_share(donor: &Cell, donor_genes: &DecodedGenes, recipient: &Cell) -> ShareOutcome {
     let shared_energy = (donor_genes.get(genome::RESOURCE_SHARING) * donor.energy * 0.1).max(0.0);
     let donor_energy = donor.energy - shared_energy;
@@ -632,6 +1139,27 @@ pub fn resolve_share(donor: &Cell, donor_genes: &DecodedGenes, recipient: &Cell)
 
 // ── Placement helper ─────────────────────────────────────────────
 
+/// Decoded genes with the cell's active-phase modifiers applied — what the
+/// cell actually expresses this tick — served from this tick's decode cache.
+///
+/// `resolve_all` used plain `decode`, so the offense and defense phase
+/// groups had no effect on anything: a cell could enter a "fight" phase and
+/// still attack with its base stats.
+
+// @veridikt
+// purpose: "Produce the phase-modified decoded genes for a cell, so action resolution sees the same expression the cell decided with"
+// depends_on: Genome.decode, Phase.apply_phase_modifiers, Genome.DecodeCache
+fn effective_genes_cached(
+    cell_id: u32,
+    cell: &Cell,
+    config: &WorldConfig,
+    cache: &mut DecodeCache,
+) -> DecodedGenes {
+    let mut genes = cache.get(cell_id, &cell.genome, config).clone();
+    crate::sim::phase::apply_phase_modifiers(&mut genes, &cell.genome, cell.active_phase);
+    genes
+}
+
 /// Check whether a cell has already been placed in the next grid.
 ///
 /// A cell is "placed" if the next-grid tile at its original position
@@ -641,10 +1169,57 @@ fn is_placed(world: &World, cell_id: u32, pos: (u16, u16)) -> bool {
 }
 
 /// Copy a cell into the next grid at the given position, setting the
-/// tile's cell_id.
+/// tile's cell_id and the cell's `position` so both stay in sync.
+
+// @veridikt
+// purpose: "Single write path for cell placement into next: sets the tile's cell_id and the cell's position field together"
+// because: "Sensing, movement and every later placement read cell.position; if it lags the tile, the cell senses from a stale spot and gets re-placed there next tick (teleporting back or overwriting another cell)"
 fn place_cell(world: &mut World, cell_id: u32, pos: (u16, u16)) {
-    let tile = world.next_tile_mut(pos.0, pos.1);
-    tile.cell_id = cell_id;
+    let occupant = world.next_tile(pos.0, pos.1).cell_id;
+    debug_assert!(
+        occupant == 0 || occupant == cell_id,
+        "placing cell {cell_id} over cell {occupant} would leave a ghost"
+    );
+    let (width, height) = (world.width, world.height);
+    let from = world.get_cell(cell_id).position;
+    world.next_tile_mut(pos.0, pos.1).cell_id = cell_id;
+    let cell = world.get_cell_mut(cell_id);
+    cell.position = pos;
+
+    // Remember which way the cell just went, so `compute_move_target` has
+    // something for memory_length to weigh. `memory_dir` was never written,
+    // which made gene 25 a no-op for every cell that ever lived.
+    let (dx, dy) = (
+        toroidal_delta(from.0, pos.0, width),
+        toroidal_delta(from.1, pos.1, height),
+    );
+    if dx != 0 || dy != 0 {
+        cell.memory_dir = (dx.signum() as i8, dy.signum() as i8);
+        cell.memory_ticks = 0;
+    }
+}
+
+/// Count down `memory_ticks` for one cell, clearing the remembered heading
+/// when its `memory_length` has run out.
+///
+/// The gene is a *duration* (`docs/spec.md` 25, "ticks of directional
+/// memory"), so the countdown is what distinguishes it from a plain weight.
+
+// @veridikt
+// purpose: "Age a cell's directional memory by one tick, clearing it once memory_length ticks have passed since the last move"
+pub fn age_memory(cell: &mut Cell, genes: &DecodedGenes) {
+    if cell.memory_dir == (0, 0) {
+        return;
+    }
+    // memory_ticks counts *up* from the move that set the heading, so there
+    // is no sentinel value to confuse with a real count.
+    let span = (genes.get(genome::MEMORY_LENGTH) * u8::MAX as f32) as u8;
+    if cell.memory_ticks >= span {
+        cell.memory_dir = (0, 0);
+        cell.memory_ticks = 0;
+    } else {
+        cell.memory_ticks += 1;
+    }
 }
 
 // ── resolve_all orchestrator ─────────────────────────────────────
@@ -653,15 +1228,22 @@ fn place_cell(world: &mut World, cell_id: u32, pos: (u16, u16)) {
 ///
 /// Actions are resolved in priority order across ALL cells:
 /// Phase 1: Reproduce — Phase 2: Attack — Phase 3: Flee/Move —
-/// Phase 4: Share — Phase 5: Idle.
+/// Phase 4: Share — Phase 5: Idle. With `flee_can_escape`, Flee/Move run
+/// before Attack, and a blow whose target has moved out of reach misses.
 ///
 /// Placement tracking: once a cell is placed in the next grid by any
 /// phase, later phases skip it (no double-placement).
+
+// @veridikt
+// purpose: "Apply every cell's chosen action into the next grid in five global priority passes, with placement tracking so no cell is written twice"
+// triggers: World.spawn_cell, World.deposit_decay, Genome.decode, Energy.corpse_decay_fade, Actions.resolve_moves, Actions.record_birth, Actions.record_attack, World.record_mut
+// because: "Resolving by action-type across ALL cells (not cell-by-cell) is what makes the outcome independent of cell order; the `is_placed` guard prevents a later pass from overwriting a cell an earlier pass already committed"
 pub fn resolve_all(
     actions: &[(u32, Action)],
     world: &mut World,
     config: &WorldConfig,
     rng: &mut impl rand::Rng,
+    cache: &mut DecodeCache,
 ) {
     let tick = world.tick;
 
@@ -671,18 +1253,20 @@ pub fn resolve_all(
             // Target tile must still be empty in next grid
             if world.next_tile(tx, ty).cell_id != 0 {
                 // Another reproduction already claimed this tile
+                world.stats.repro_blocked += 1;
                 place_cell(world, cell_id, world.get_cell(cell_id).position);
                 continue;
             }
 
             let parent = world.get_cell(cell_id);
-            let genes = parent.genome.decode(config);
+            let genes = effective_genes_cached(cell_id, parent, config, cache);
             let pos = parent.position;
 
-            let outcome = resolve_reproduction(parent, &genes, (tx, ty), rng);
+            let outcome = resolve_reproduction(parent, &genes, (tx, ty), config, rng);
 
             // Place child in next grid
             let child_id = world.spawn_cell(outcome.child);
+            cache.invalidate(child_id);
             place_cell(world, child_id, (tx, ty));
 
             // Update parent state and place at original position
@@ -690,19 +1274,45 @@ pub fn resolve_all(
             parent_mut.energy = outcome.parent_energy;
             parent_mut.cooldown_remaining = outcome.parent_cooldown;
             place_cell(world, cell_id, pos);
+            record_birth(world, cell_id, child_id);
         }
+    }
+
+    // With `flee_can_escape`, cells move before any blow lands: every
+    // action is simultaneous, and a strike aimed at where a cell stood misses
+    // if it has left the attacker's reach. Otherwise the attack pass places
+    // the defender first, and a cell under attack can never get away.
+    if config.flee_can_escape {
+        resolve_moves(actions, world, config, cache);
     }
 
     // ── Phase 2: Attack ──────────────────────────────────────────
     for &(cell_id, ref action) in actions {
         if let Action::Attack(target_id) = *action {
             let attacker_cell = world.get_cell(cell_id);
-            let attacker_genes = attacker_cell.genome.decode(config);
+            let attacker_genes = effective_genes_cached(cell_id, attacker_cell, config, cache);
             let attacker_pos = attacker_cell.position;
 
             let defender_cell = world.get_cell(target_id);
-            let defender_genes = defender_cell.genome.decode(config);
+            let defender_genes = effective_genes_cached(target_id, defender_cell, config, cache);
             let defender_pos = defender_cell.position;
+
+            if config.flee_can_escape
+                && toroidal_dist(
+                    attacker_pos.0,
+                    attacker_pos.1,
+                    defender_pos.0,
+                    defender_pos.1,
+                    world.width,
+                    world.height,
+                ) > mapped_attack_range(&attacker_genes) as i32
+            {
+                world.stats.attacks_missed += 1;
+                if !is_placed(world, cell_id, attacker_pos) {
+                    place_cell(world, cell_id, attacker_pos);
+                }
+                continue;
+            }
 
             let attacker_stats = CombatStats {
                 cell_id,
@@ -720,17 +1330,64 @@ pub fn resolve_all(
             let outcome = resolve_attack(&attacker_stats, &defender_stats);
 
             // Apply damage to attacker
+            let attacker_energy_before = world.get_cell(cell_id).energy;
             let a = world.get_cell_mut(cell_id);
             a.energy -= outcome.damage_to_attacker;
             a.last_damage_tick = tick as u32;
 
             // Apply damage + venom to defender
+            let defender_energy_before = world.get_cell(target_id).energy;
             let d = world.get_cell_mut(target_id);
             d.energy -= outcome.damage_to_defender;
             d.last_damage_tick = tick as u32;
             if outcome.venom_ticks > 0 {
                 d.venom_ticks = outcome.venom_ticks;
                 d.venom_damage = outcome.venom_damage;
+            }
+            let killed = !d.is_alive();
+
+            // A kill feeds the killer: predation_efficiency of the victim's
+            // energy is absorbed. Without this, attacking was pure loss for
+            // both sides and no predator could ever pay for itself. The gene
+            // scales within `max_predation_efficiency`, and with
+            // `corpses_keep_energy` what the killer does not take stays in
+            // the body for scavengers instead of vanishing.
+            if killed && defender_energy_before > 0.0 {
+                let share = attacker_genes.get(genome::PREDATION_EFFICIENCY)
+                    * config.max_predation_efficiency;
+                let absorbed = share * defender_energy_before;
+                world.get_cell_mut(cell_id).energy += absorbed;
+                world.stats.income[stats::PREDATION] += absorbed as f64;
+                world.record_mut(cell_id).income[stats::PREDATION] += absorbed;
+                let uneaten = defender_energy_before - absorbed;
+                if config.corpses_keep_energy && uneaten > 0.0 {
+                    let fade = crate::sim::energy::corpse_decay_fade(&defender_genes, config);
+                    let idx = world.tile_index(defender_pos.0, defender_pos.1);
+                    world.deposit_decay(idx, uneaten, fade);
+                    world.stats.decay_deposited += uneaten as f64;
+                }
+            }
+            // After the meal: an attacker hit back to zero can be revived by
+            // what it absorbs, and is then not a combat death.
+            record_attack(
+                world,
+                cell_id,
+                target_id,
+                &outcome,
+                attacker_energy_before,
+                defender_energy_before,
+            );
+            // ...and may absorb some of its genome with it (spec.md gene 44).
+            if killed {
+                let victim = world.get_cell(target_id).genome.clone();
+                if world
+                    .get_cell_mut(cell_id)
+                    .genome
+                    .absorb_from(&victim, config, rng)
+                {
+                    // The genome changed under the cache.
+                    cache.invalidate(cell_id);
+                }
             }
 
             // Place both at their original positions (if not already placed)
@@ -744,37 +1401,8 @@ pub fn resolve_all(
     }
 
     // ── Phase 3: Flee + Move ─────────────────────────────────────
-    let mut move_intents: Vec<MoveIntent> = Vec::new();
-
-    for &(cell_id, ref action) in actions {
-        let (tx, ty) = match *action {
-            Action::Flee(x, y) | Action::Move(x, y) => (x, y),
-            _ => continue,
-        };
-
-        // Skip cells already placed by earlier phases
-        let cell = world.get_cell(cell_id);
-        let pos = cell.position;
-        if is_placed(world, cell_id, pos) {
-            continue;
-        }
-
-        let genes = cell.genome.decode(config);
-        move_intents.push(MoveIntent {
-            cell_id,
-            target: (tx, ty),
-            rigidity: genes.get(genome::RIGIDITY),
-            source: pos,
-        });
-    }
-
-    let move_outcomes = resolve_movement_conflicts(&move_intents);
-
-    for outcome in &move_outcomes {
-        match *outcome {
-            MoveOutcome::Wins(cid, x, y) => place_cell(world, cid, (x, y)),
-            MoveOutcome::Loses(cid, x, y) => place_cell(world, cid, (x, y)),
-        }
+    if !config.flee_can_escape {
+        resolve_moves(actions, world, config, cache);
     }
 
     // ── Phase 4: Share ───────────────────────────────────────────
@@ -785,10 +1413,11 @@ pub fn resolve_all(
             let recipient = world.get_cell(target_id);
             let recipient_pos = recipient.position;
 
-            let donor_genes = donor.genome.decode(config);
+            let donor_genes = effective_genes_cached(cell_id, donor, config, cache);
             let outcome = resolve_share(donor, &donor_genes, recipient);
 
             // Apply energy changes
+            world.stats.shared += (world.get_cell(cell_id).energy - outcome.donor_energy) as f64;
             world.get_cell_mut(cell_id).energy = outcome.donor_energy;
             world.get_cell_mut(target_id).energy = outcome.recipient_energy;
 
@@ -810,6 +1439,131 @@ pub fn resolve_all(
                 place_cell(world, cell_id, pos);
             }
         }
+    }
+}
+
+/// Resolve every Flee and Move into the next grid: conflicts over a tile go
+/// to the higher rigidity, losers stay where they were. Cells already placed
+/// by an earlier pass are left alone.
+
+// @veridikt
+// purpose: "Place every fleeing or moving cell that no earlier pass has placed, resolving contested target tiles by rigidity"
+// triggers: Actions.resolve_movement_conflicts, Actions.place_cell
+// because: "It runs after the attack pass by default, which pins an attacked cell where it stood; with flee_can_escape it runs before it, so a cell that moved out of reach is missed"
+fn resolve_moves(
+    actions: &[(u32, Action)],
+    world: &mut World,
+    config: &WorldConfig,
+    cache: &mut DecodeCache,
+) {
+    let mut move_intents: Vec<MoveIntent> = Vec::new();
+
+    for &(cell_id, ref action) in actions {
+        let (tx, ty) = match *action {
+            Action::Flee(x, y) | Action::Move(x, y) => (x, y),
+            _ => continue,
+        };
+
+        // Skip cells already placed by earlier phases
+        let cell = world.get_cell(cell_id);
+        let pos = cell.position;
+        if is_placed(world, cell_id, pos) {
+            continue;
+        }
+
+        let genes = effective_genes_cached(cell_id, cell, config, cache);
+        move_intents.push(MoveIntent {
+            cell_id,
+            target: (tx, ty),
+            rigidity: genes.get(genome::RIGIDITY),
+            source: pos,
+        });
+    }
+
+    let move_outcomes = resolve_movement_conflicts(&move_intents);
+
+    for outcome in &move_outcomes {
+        match *outcome {
+            // A newborn may already hold the target in next (targets are
+            // only checked against current); the mover then stays put.
+            MoveOutcome::Wins(cid, x, y) if world.next_tile(x, y).cell_id != 0 => {
+                let source = world.get_cell(cid).position;
+                place_cell(world, cid, source);
+            }
+            MoveOutcome::Wins(cid, x, y) => place_cell(world, cid, (x, y)),
+            MoveOutcome::Loses(cid, x, y) => place_cell(world, cid, (x, y)),
+        }
+    }
+}
+
+/// Count a birth: the child joins its parent's lineage, and the tick stats
+/// learn how far mutation moved it.
+
+// @veridikt
+// purpose: "Tag a newborn with its parent's lineage, count the birth and its mutation distance, and label a stillborn child or a parent that died giving birth"
+// triggers: World.record_mut
+// because: "Lineage inheritance is what lets the lab follow a founder's descendants; the labels exist because a zero-energy birth is a real death path the counters would otherwise miss"
+fn record_birth(world: &mut World, parent_id: u32, child_id: u32) {
+    let parent = world.get_cell(parent_id);
+    let child = world.get_cell(child_id);
+    let distance = genetic_distance(&parent.genome, &child.genome);
+    let mutated = parent
+        .genome
+        .data
+        .iter()
+        .zip(child.genome.data.iter())
+        .filter(|(a, b)| a != b)
+        .count() as u32;
+    let child_dead = !child.is_alive();
+    let parent_dead = !parent.is_alive();
+    let lineage = world.record(parent_id).lineage;
+    world.record_mut(child_id).lineage = lineage;
+    if child_dead {
+        world.record_mut(child_id).death = Some(DeathCause::Stillborn);
+    }
+    if parent_dead {
+        world.record_mut(parent_id).death = Some(DeathCause::Childbirth);
+    }
+    let s = &mut world.stats;
+    s.births += 1;
+    s.child_distance += distance as f64;
+    s.child_mutated_bytes += mutated;
+}
+
+/// Count an attack, and label whoever it took from alive to dead. The death
+/// itself is counted at cleanup, from the label: a cell struck to zero can
+/// still be revived later in the tick, and the energy phase then clears the
+/// label (`tick::record_energy`).
+
+// @veridikt
+// purpose: "Count an attack and its genetic distance, and label a defender or attacker the exchange took from alive to dead"
+// triggers: World.record_mut
+// because: "The death itself is counted at cleanup from the label, so a cell revived later in the tick is never counted as a kill"
+fn record_attack(
+    world: &mut World,
+    attacker: u32,
+    defender: u32,
+    outcome: &AttackOutcome,
+    attacker_energy_before: f32,
+    defender_energy_before: f32,
+) {
+    let same_lineage = world.record(attacker).lineage == world.record(defender).lineage;
+    let distance = genetic_distance(
+        &world.get_cell(attacker).genome,
+        &world.get_cell(defender).genome,
+    );
+    let defender_killed = defender_energy_before > 0.0 && !world.get_cell(defender).is_alive();
+    let attacker_killed = attacker_energy_before > 0.0 && !world.get_cell(attacker).is_alive();
+    let s = &mut world.stats;
+    s.attacks += 1;
+    s.same_lineage_attacks += same_lineage as u32;
+    s.attack_distance += distance as f64;
+    s.combat_damage += (outcome.damage_to_defender + outcome.damage_to_attacker) as f64;
+    if defender_killed {
+        world.record_mut(defender).death = Some(DeathCause::Combat);
+    }
+    if attacker_killed {
+        world.record_mut(attacker).death = Some(DeathCause::Retaliation);
     }
 }
 
@@ -887,6 +1641,7 @@ mod tests {
         let tile = Tile {
             cell_id: 5,
             decay_energy: 3.0,
+            decay_fade: 0.02,
             pheromone: 1.5,
             toxin: 0.7,
             temperature: 200,
@@ -935,7 +1690,7 @@ mod tests {
         world.set_current_tile_cell_id(6, 5, id_b);
 
         let genes = genome_a.decode(&config);
-        let result = sense(&cell_a, &genes, &world);
+        let result = sense(&cell_a, &genes, &world, &config);
 
         assert_eq!(result.neighbor_count, 1);
     }
@@ -957,7 +1712,7 @@ mod tests {
         world.set_current_tile_cell_id(8, 5, id_b);
 
         let genes = genome_a.decode(&config);
-        let result = sense(&cell_a, &genes, &world);
+        let result = sense(&cell_a, &genes, &world, &config);
 
         assert_eq!(
             result.neighbor_count, 0,
@@ -989,7 +1744,7 @@ mod tests {
         world.set_current_tile_cell_id(4, 5, id_threat);
 
         let genes = genome_a.decode(&config);
-        let result = sense(&cell_a, &genes, &world);
+        let result = sense(&cell_a, &genes, &world, &config);
 
         assert_eq!(result.neighbor_count, 2);
         assert!(result.kin_count >= 1, "similar neighbor should be kin");
@@ -1008,7 +1763,7 @@ mod tests {
         let cell = make_cell_at(5, 5, genome.clone(), 50.0);
         let genes = genome.decode(&config);
 
-        let result = sense(&cell, &genes, &world);
+        let result = sense(&cell, &genes, &world, &config);
 
         // All 8 adjacent tiles should be empty in a fresh world
         assert_eq!(result.empty_adjacent.len(), 8);
@@ -1031,7 +1786,7 @@ mod tests {
         world.current_grid_mut()[idx].decay_energy = 10.0;
 
         let genes = genome.decode(&config);
-        let result = sense(&cell, &genes, &world);
+        let result = sense(&cell, &genes, &world, &config);
 
         assert!(
             result.food_nearby,
@@ -1057,7 +1812,7 @@ mod tests {
         world.current_grid_mut()[idx].pheromone = 10.0;
 
         let genes = genome.decode(&config);
-        let result = sense(&cell, &genes, &world);
+        let result = sense(&cell, &genes, &world, &config);
 
         // Gradient should point right (positive x)
         assert!(
@@ -1091,6 +1846,12 @@ mod tests {
                 pheromone: 0.0,
             },
             empty_adjacent: vec![(6, 5), (4, 5), (5, 6), (5, 4)],
+            empty_scatter: vec![(6, 5), (4, 5), (5, 6), (5, 4)],
+            free_run: [0; 8],
+            nearest_threat_armor: 0.0,
+            threats: Vec::new(),
+            own_food_share: 0.0,
+            world_size: (16, 16),
         }
     }
 
@@ -1111,12 +1872,43 @@ mod tests {
         let sense = base_sense_result();
         let mut rng = ChaCha8Rng::seed_from_u64(42);
 
-        let action = decide(&cell, &genes, &sense, &mut rng);
+        let action = decide(&cell, &genes, &sense, &config, &mut rng);
         assert!(
             matches!(action, Action::Reproduce(_, _)),
             "should reproduce with high energy: got {:?}",
             action
         );
+    }
+
+    #[test]
+    fn maturity_never_outlives_the_cell() {
+        // A lineage that matures after it dies is sterile by construction:
+        // seed 2 of the harness lost all 117 cells that way.
+        let config = small_config();
+        let mut data = [10u8; GENOME_LEN];
+        data[genome::MATURITY_AGE] = 255; // matures as late as possible
+        data[genome::MAX_AGE] = 0; // dies as early as possible
+        let genes = Genome::new(data).decode(&config);
+
+        let maturity = mapped_maturity_age(&genes, &config);
+        let lifespan = crate::sim::energy::lifespan_ticks(&genes, &config);
+        assert!(
+            maturity < lifespan,
+            "maturity {maturity} must fall inside lifespan {lifespan}"
+        );
+    }
+
+    #[test]
+    fn reproduction_threshold_respects_absolute_floor() {
+        // A tiny-cap cell must not be able to split at near-zero energy.
+        let config = small_config();
+        let mut data = [10u8; GENOME_LEN];
+        data[genome::ENERGY_STORAGE_CAP] = 0;
+        data[genome::REPRODUCTION_THRESHOLD] = 0;
+        let genes = Genome::new(data).decode(&config);
+
+        let threshold = mapped_reproduction_threshold(&genes, &config);
+        assert_eq!(threshold, config.reproduction_energy_floor);
     }
 
     #[test]
@@ -1135,7 +1927,7 @@ mod tests {
         let sense = base_sense_result();
         let mut rng = ChaCha8Rng::seed_from_u64(42);
 
-        let action = decide(&cell, &genes, &sense, &mut rng);
+        let action = decide(&cell, &genes, &sense, &config, &mut rng);
         assert!(
             !matches!(action, Action::Reproduce(_, _)),
             "should NOT reproduce while on cooldown: got {:?}",
@@ -1158,7 +1950,7 @@ mod tests {
         sense.nearest_threat = Some((6, 5, 42, 1)); // adjacent threat
 
         let mut rng = ChaCha8Rng::seed_from_u64(42);
-        let action = decide(&cell, &genes, &sense, &mut rng);
+        let action = decide(&cell, &genes, &sense, &config, &mut rng);
         assert!(
             matches!(action, Action::Attack(42)),
             "should attack adjacent threat: got {:?}",
@@ -1182,7 +1974,7 @@ mod tests {
         sense.nearest_threat = Some((7, 5, 42, 2)); // threat at distance 2
 
         let mut rng = ChaCha8Rng::seed_from_u64(42);
-        let action = decide(&cell, &genes, &sense, &mut rng);
+        let action = decide(&cell, &genes, &sense, &config, &mut rng);
         assert!(
             matches!(action, Action::Flee(_, _)),
             "should flee from distant threat: got {:?}",
@@ -1204,7 +1996,7 @@ mod tests {
         let sense = base_sense_result();
         let mut rng = ChaCha8Rng::seed_from_u64(42);
 
-        let action = decide(&cell, &genes, &sense, &mut rng);
+        let action = decide(&cell, &genes, &sense, &config, &mut rng);
         assert!(
             matches!(action, Action::Move(_, _)),
             "should move with high speed and no threats: got {:?}",
@@ -1213,6 +2005,139 @@ mod tests {
     }
 
     // ── resolve_movement_conflicts tests ──────────────────────────────
+
+    #[test]
+    fn chemotaxis_steers_toward_food() {
+        // docs/spec.md gene 9: "tendency to move toward nearby energy
+        // sources". The gene used to be spent on the pheromone gradient
+        // while `nearest_food` was computed and never read, so nothing in
+        // the simulation ever moved toward food.
+        let config = small_config();
+        let target_with = |chemotaxis: u8| {
+            let mut data = [0u8; GENOME_LEN];
+            data[genome::SPEED] = 255;
+            data[genome::DIRECTION_BIAS] = 16; // heading east, tilted south
+            data[genome::DIRECTION_NOISE] = 0;
+            data[genome::CHEMOTAXIS_STRENGTH] = chemotaxis;
+            let genome = Genome::new(data);
+            let genes = genome.decode(&config);
+            let cell = make_cell_at(5, 5, genome, 50.0);
+            let mut sense = base_sense_result();
+            sense.nearest_food = Some((5, 8)); // three tiles south
+            let mut rng = ChaCha8Rng::seed_from_u64(3);
+            compute_move_target(&cell, &genes, &sense, &mut rng).unwrap()
+        };
+
+        assert_eq!(
+            target_with(0),
+            (6, 5),
+            "with no chemotaxis it follows its heading"
+        );
+        assert_eq!(
+            target_with(255),
+            (5, 6),
+            "with chemotaxis it turns toward food"
+        );
+    }
+
+    #[test]
+    fn a_predator_hunts_the_nearest_prey() {
+        // "predators roam aimlessly even with prey a few pixels away":
+        // tile-based food detection never gave a hunter a target.
+        let config = small_config();
+        let mut data = [0u8; GENOME_LEN];
+        data[genome::PREDATION_EFFICIENCY] = 255;
+        data[genome::SENSE_RADIUS] = 255;
+        data[genome::AGGRESSION_TRIGGER] = 0; // everything is a threat
+        let genome = Genome::new(data);
+        let genes = genome.decode(&config);
+
+        let hunter = make_cell_at(5, 5, genome.clone(), 50.0);
+        let prey = make_cell_at(7, 5, make_genome(200), 50.0);
+        let (world, ids) = setup_world_with_cells(&config, vec![hunter, prey]);
+
+        let sensed = sense(world.get_cell(ids[0]), &genes, &world, &config);
+        assert_eq!(
+            sensed.nearest_food,
+            Some((7, 5)),
+            "a predator's food is the nearest prey"
+        );
+    }
+
+    #[test]
+    fn direction_noise_is_symmetric() {
+        // A one-sided noise term rotates every heading the same way, so a
+        // cell heading +x picks the tile above far more often than the one
+        // below. Symmetric noise splits them evenly.
+        let config = small_config();
+        let mut data = [0u8; GENOME_LEN];
+        data[genome::SPEED] = 255;
+        data[genome::DIRECTION_BIAS] = 0; // heading 0 rad = +x
+        data[genome::DIRECTION_NOISE] = 255;
+        let genome = Genome::new(data);
+        let genes = genome.decode(&config);
+        let cell = make_cell_at(5, 5, genome, 50.0);
+        let sense = base_sense_result();
+        let mut rng = ChaCha8Rng::seed_from_u64(7);
+
+        let (mut ccw, mut cw) = (0, 0);
+        for _ in 0..4000 {
+            match compute_move_target(&cell, &genes, &sense, &mut rng).unwrap() {
+                (5, 6) => ccw += 1,
+                (5, 4) => cw += 1,
+                _ => {}
+            }
+        }
+        let skew = (ccw - cw) as f32 / (ccw + cw) as f32;
+        assert!(
+            skew.abs() < 0.1,
+            "turns should not favour one side: {ccw} vs {cw} (skew {skew})"
+        );
+    }
+
+    #[test]
+    fn move_target_uses_toroidal_delta_at_seam() {
+        // A cell on the left edge heading -x must step across the seam to
+        // x = width - 1, not be repelled by an unwrapped delta of +15.
+        let config = small_config();
+        let mut data = [0u8; GENOME_LEN];
+        data[genome::SPEED] = 255;
+        data[genome::DIRECTION_BIAS] = 128; // ~pi rad = -x
+        data[genome::DIRECTION_NOISE] = 0;
+        let genome = Genome::new(data);
+        let genes = genome.decode(&config);
+        let cell = make_cell_at(0, 5, genome, 50.0);
+        let mut sense = base_sense_result();
+        sense.empty_adjacent = vec![(15, 5), (1, 5), (0, 4), (0, 6)];
+        let mut rng = ChaCha8Rng::seed_from_u64(7);
+
+        let target = compute_move_target(&cell, &genes, &sense, &mut rng).unwrap();
+        assert_eq!(
+            target,
+            (15, 5),
+            "should step across the seam, got {target:?}"
+        );
+    }
+
+    #[test]
+    fn flee_crosses_seam_away_from_threat() {
+        // Threat at x = 15 is one tile to the cell's left across the seam,
+        // so fleeing means stepping right, to x = 1.
+        let cell = make_cell_at(0, 5, make_genome(128), 50.0);
+        let mut sense = base_sense_result();
+        sense.nearest_threat = Some((15, 5, 7, 1));
+        sense.empty_adjacent = vec![(15, 4), (1, 5), (0, 6)];
+
+        assert_eq!(flee_direction(&cell, (15, 5), &sense), Some((1, 5)));
+    }
+
+    #[test]
+    fn toroidal_delta_takes_short_way() {
+        assert_eq!(toroidal_delta(0, 15, 16), -1);
+        assert_eq!(toroidal_delta(15, 0, 16), 1);
+        assert_eq!(toroidal_delta(5, 6, 16), 1);
+        assert_eq!(toroidal_delta(5, 5, 16), 0);
+    }
 
     #[test]
     fn movement_no_conflict_all_win() {
@@ -1340,7 +2265,7 @@ mod tests {
         let sense = base_sense_result();
         let mut rng = ChaCha8Rng::seed_from_u64(42);
 
-        let action = decide(&cell, &genes, &sense, &mut rng);
+        let action = decide(&cell, &genes, &sense, &config, &mut rng);
         assert_eq!(action, Action::Idle, "sessile cell should idle");
     }
 
@@ -1430,7 +2355,7 @@ mod tests {
         let genes = genome.decode(&config);
         let mut rng = ChaCha8Rng::seed_from_u64(42);
 
-        let outcome = resolve_reproduction(&parent, &genes, (6, 5), &mut rng);
+        let outcome = resolve_reproduction(&parent, &genes, (6, 5), &config, &mut rng);
 
         let share = genes.get(genome::OFFSPRING_ENERGY_SHARE);
         let expected_child = 100.0 * share;
@@ -1446,6 +2371,49 @@ mod tests {
         );
     }
 
+    /// A share that decodes to 0 made a zero-energy child: counted as a
+    /// birth, dead at cleanup, and leaving `corpse_biomass` of decay made from
+    /// nothing. A share of 1 left the parent at zero, dead in childbirth. The
+    /// share is now bounded, so both are born alive — and alive with enough
+    /// to survive the tick they are born in, not just above zero.
+    #[test]
+    fn neither_child_nor_parent_is_born_dead_whatever_the_share_gene() {
+        let config = small_config();
+        let mut rng = ChaCha8Rng::seed_from_u64(42);
+        let parent_energy = config.reproduction_energy_floor;
+        for byte in [0u8, 255] {
+            let mut data = [0u8; GENOME_LEN];
+            data[genome::OFFSPRING_ENERGY_SHARE] = byte;
+            let genome = Genome::new(data);
+            let genes = genome.decode(&config);
+            // The genome really does decode to the degenerate end.
+            assert_eq!(
+                genes.get(genome::OFFSPRING_ENERGY_SHARE),
+                byte as f32 / 255.0
+            );
+            let parent = make_cell_at(5, 5, genome, parent_energy);
+
+            let outcome = resolve_reproduction(&parent, &genes, (6, 5), &config, &mut rng);
+
+            let floor = parent_energy * config.min_offspring_energy_share;
+            let kept = parent_energy * (1.0 - config.max_offspring_energy_share);
+            assert!(
+                outcome.child.energy >= floor - 1e-4,
+                "share byte {byte}: child born with {} energy (floor {floor})",
+                outcome.child.energy
+            );
+            assert!(
+                outcome.parent_energy >= kept - 1e-4,
+                "share byte {byte}: parent left with {} energy (floor {kept})",
+                outcome.parent_energy
+            );
+            // What a cell of this genome burns in a tick: both must outlive
+            // the energy phase of the tick they split in.
+            let drain = crate::sim::energy::metabolic_cost(&genes, 128, &config);
+            assert!(outcome.child.energy > drain && outcome.parent_energy > drain);
+        }
+    }
+
     #[test]
     fn reproduction_child_placed_at_target() {
         let config = small_config();
@@ -1455,7 +2423,7 @@ mod tests {
         let genes = genome.decode(&config);
         let mut rng = ChaCha8Rng::seed_from_u64(42);
 
-        let outcome = resolve_reproduction(&parent, &genes, (6, 5), &mut rng);
+        let outcome = resolve_reproduction(&parent, &genes, (6, 5), &config, &mut rng);
 
         assert_eq!(outcome.child.position, (6, 5));
     }
@@ -1470,7 +2438,7 @@ mod tests {
         let genes = genome.decode(&config);
         let mut rng = ChaCha8Rng::seed_from_u64(42);
 
-        let outcome = resolve_reproduction(&parent, &genes, (6, 5), &mut rng);
+        let outcome = resolve_reproduction(&parent, &genes, (6, 5), &config, &mut rng);
         let expected_cooldown = mapped_reproduction_cooldown(&genes);
 
         assert_eq!(outcome.parent_cooldown, expected_cooldown);
@@ -1488,7 +2456,7 @@ mod tests {
         let genes = genome.decode(&config);
         let mut rng = ChaCha8Rng::seed_from_u64(42);
 
-        let outcome = resolve_reproduction(&parent, &genes, (6, 5), &mut rng);
+        let outcome = resolve_reproduction(&parent, &genes, (6, 5), &config, &mut rng);
 
         assert_eq!(outcome.child.age, 0, "child should start at age 0");
         assert_eq!(outcome.child.venom_ticks, 0, "child should have no venom");
@@ -1563,7 +2531,13 @@ mod tests {
         let mut rng = ChaCha8Rng::seed_from_u64(42);
 
         let actions = vec![(ids[0], Action::Idle)];
-        resolve_all(&actions, &mut world, &config, &mut rng);
+        resolve_all(
+            &actions,
+            &mut world,
+            &config,
+            &mut rng,
+            &mut DecodeCache::default(),
+        );
 
         assert_eq!(
             world.next_tile(5, 5).cell_id,
@@ -1580,7 +2554,13 @@ mod tests {
         let mut rng = ChaCha8Rng::seed_from_u64(42);
 
         let actions = vec![(ids[0], Action::Move(6, 5))];
-        resolve_all(&actions, &mut world, &config, &mut rng);
+        resolve_all(
+            &actions,
+            &mut world,
+            &config,
+            &mut rng,
+            &mut DecodeCache::default(),
+        );
 
         assert_eq!(
             world.next_tile(6, 5).cell_id,
@@ -1595,6 +2575,444 @@ mod tests {
     }
 
     #[test]
+    fn a_move_writes_the_remembered_heading_and_it_expires() {
+        // spec.md gene 25: "ticks of directional memory. 0 = purely
+        // reactive." `memory_dir` was read by compute_move_target but never
+        // written, so the term was always zero for every cell.
+        let config = WorldConfig {
+            grid_width: 16,
+            grid_height: 16,
+            vent_count: 0,
+            ..WorldConfig::default()
+        };
+        let mut world = World::new(&config);
+        let mut data = [0u8; GENOME_LEN];
+        data[genome::MEMORY_LENGTH] = 255;
+        let id = world.spawn_cell(Cell::new(Genome::new(data), 50.0, (5, 5)));
+        world.set_current_tile_cell_id(5, 5, id);
+        world.prepare_next();
+
+        place_cell(&mut world, id, (6, 5));
+        assert_eq!(world.get_cell(id).memory_dir, (1, 0));
+
+        // A long memory_length keeps it for many ticks; a zero one drops it
+        // on the first.
+        let long = Genome::new(data).decode(&config);
+        data[genome::MEMORY_LENGTH] = 0;
+        let short = Genome::new(data).decode(&config);
+
+        let mut forgetful = world.get_cell(id).clone();
+        age_memory(&mut forgetful, &short);
+        assert_eq!(
+            forgetful.memory_dir,
+            (0, 0),
+            "a memory_length-0 cell kept a heading"
+        );
+
+        let mut persistent = world.get_cell(id).clone();
+        for _ in 0..20 {
+            age_memory(&mut persistent, &long);
+        }
+        assert_eq!(
+            persistent.memory_dir,
+            (1, 0),
+            "a long memory expired in 20 ticks"
+        );
+    }
+
+    #[test]
+    fn adhesion_holds_a_cell_among_its_kin() {
+        // spec.md gene 28: "tendency to stick to adjacent genetically
+        // similar cells. Enables cluster formation." Never read, so nothing
+        // held a colony together.
+        let config = WorldConfig {
+            grid_width: 16,
+            grid_height: 16,
+            vent_count: 0,
+            ..WorldConfig::default()
+        };
+        let mut data = [0u8; GENOME_LEN];
+        data[genome::SPEED] = 255;
+        let free = Genome::new(data).decode(&config);
+        data[genome::ADHESION] = 255;
+        let sticky = Genome::new(data).decode(&config);
+
+        let cell = Cell::new(Genome::new(data), 10.0, (5, 5));
+        let mut sense = base_sense_result();
+        sense.neighbor_count = 8;
+        sense.kin_count = 8; // entirely surrounded by relatives
+
+        let moves = |genes: &DecodedGenes, seed: u64| {
+            let mut rng = ChaCha8Rng::seed_from_u64(seed);
+            (0..400)
+                .filter(|_| {
+                    matches!(
+                        decide(&cell, genes, &sense, &config, &mut rng),
+                        Action::Move(..)
+                    )
+                })
+                .count()
+        };
+        let loose = moves(&free, 4);
+        let stuck = moves(&sticky, 4);
+        assert!(
+            stuck < loose / 2,
+            "a fully adhesive cell moved {stuck} times of 400 against {loose} for a free one"
+        );
+    }
+
+    #[test]
+    fn a_fast_cell_covers_several_tiles_but_never_through_another_cell() {
+        // speed stays the chance of moving (spec.md gene 6); max_move_distance
+        // sets how far a move goes. With it at 1 nothing changes.
+        let mut data = [0u8; GENOME_LEN];
+        data[genome::SPEED] = 255;
+        let config = WorldConfig {
+            max_move_distance: 4,
+            ..WorldConfig::default()
+        };
+        let genes = Genome::new(data).decode(&config);
+        let east = HEADINGS.iter().position(|&h| h == (1, 0)).unwrap();
+
+        let mut sense = base_sense_result();
+        sense.free_run[east] = 4;
+        assert_eq!(extend_move((5, 5), (6, 5), &genes, &sense, &config), (9, 5));
+
+        // Blocked after two tiles: stop in front of the obstacle.
+        sense.free_run[east] = 2;
+        assert_eq!(extend_move((5, 5), (6, 5), &genes, &sense, &config), (7, 5));
+
+        // The spec's one-tile world is untouched.
+        let one = WorldConfig::default();
+        sense.free_run[east] = 4;
+        assert_eq!(extend_move((5, 5), (6, 5), &genes, &sense, &one), (6, 5));
+    }
+
+    #[test]
+    fn harmless_prey_runs_from_an_adjacent_threat_instead_of_fighting_it() {
+        // Attack is gated before Flee, so a cell with a threat adjacent
+        // "attacked" it however harmless its blow — prey fought predators
+        // instead of running. With attack_only_when_harmful it flees.
+        let mut data = [0u8; GENOME_LEN];
+        data[genome::FLEE_RESPONSE] = 255;
+        let cell = Cell::new(Genome::new(data), 10.0, (5, 5));
+        let mut sense = base_sense_result();
+        sense.nearest_threat = Some((6, 5, 42, 1));
+        sense.nearest_threat_armor = 50.0;
+
+        let old = WorldConfig::default();
+        let genes = Genome::new(data).decode(&old);
+        let mut rng = ChaCha8Rng::seed_from_u64(1);
+        assert!(matches!(
+            decide(&cell, &genes, &sense, &old, &mut rng),
+            Action::Attack(42)
+        ));
+
+        let new = WorldConfig {
+            attack_only_when_harmful: true,
+            ..WorldConfig::default()
+        };
+        assert!(
+            matches!(
+                decide(&cell, &genes, &sense, &new, &mut rng),
+                Action::Flee(..)
+            ),
+            "a cell that cannot get through the threat's armour still attacked it"
+        );
+    }
+
+    /// Flee had no roll and no judgement: any non-kin in sight sent a cell
+    /// with any flee_response at all running, every tick — including from a
+    /// neighbour whose blow its armour stops. With `flee_can_escape` a cell
+    /// runs only from what can hurt it (a blow through its armour, or venom),
+    /// and only as often as `speed * flee_response`.
+    #[test]
+    fn a_cell_flees_only_from_what_can_hurt_it_and_only_as_often_as_it_can_move() {
+        let config = WorldConfig {
+            flee_can_escape: true,
+            ..small_config()
+        };
+        let flights = |data: [u8; GENOME_LEN], attack: f32, venom: f32| {
+            let genome = Genome::new(data);
+            let genes = genome.decode(&config);
+            let mut cell = make_cell_at(5, 5, genome, 10.0);
+            cell.cooldown_remaining = 1; // no reproduction
+            // Two tiles away: out of the cell's own attack range (1), so the
+            // Attack gate never takes it first.
+            let mut sense = base_sense_result();
+            sense.nearest_threat = Some((7, 5, 42, 2));
+            sense.threats = vec![Threat {
+                pos: (7, 5),
+                cell_id: 42,
+                dist: 2,
+                attack_power: attack,
+                venom,
+            }];
+            let mut rng = ChaCha8Rng::seed_from_u64(7);
+            let n = (0..200)
+                .filter(|_| {
+                    matches!(
+                        decide(&cell, &genes, &sense, &config, &mut rng),
+                        Action::Flee(..)
+                    )
+                })
+                .count();
+            (n, genes)
+        };
+
+        let mut runner = [0u8; GENOME_LEN];
+        runner[genome::FLEE_RESPONSE] = 255;
+        runner[genome::SPEED] = 255;
+        runner[genome::ARMOR] = 100;
+        let armor = Genome::new(runner).decode(&config).get(genome::ARMOR);
+        assert!(armor > 0.05, "the runner needs some armour to test against");
+
+        let (harmless, _) = flights(runner, armor * 0.5, 0.0);
+        assert_eq!(harmless, 0, "ran from a blow its armour stops");
+
+        let (strong, genes) = flights(runner, armor + 0.2, 0.0);
+        let p = genes.get(genome::SPEED) * genes.get(genome::FLEE_RESPONSE);
+        assert!(p < 0.9, "the test needs a roll that can fail, p = {p}");
+        let expected = p * 200.0;
+        assert!(
+            (strong as f32 - expected).abs() < 30.0,
+            "fled {strong}/200 times from a real threat, expected about {expected:.0}"
+        );
+
+        let (venomous, _) = flights(runner, 0.0, 0.5);
+        assert!(
+            venomous > 0,
+            "venom gets through any armour, so it is worth running from"
+        );
+
+        let mut sessile = runner;
+        sessile[genome::SPEED] = 0;
+        let (stuck, _) = flights(sessile, armor + 0.2, 0.0);
+        assert_eq!(stuck, 0, "a cell with no speed cannot flee");
+    }
+
+    /// The attack pass placed the defender before Flee/Move ran, and those
+    /// skip placed cells, so an attacked cell could never get away. With
+    /// `flee_can_escape` movement resolves first: a blow at a cell that has
+    /// left the attacker's reach misses, and one still in reach lands.
+    #[test]
+    fn a_cell_that_flees_out_of_reach_is_missed() {
+        let run = |escape: bool, flee_to: (u16, u16)| {
+            let config = WorldConfig {
+                flee_can_escape: escape,
+                ..small_config()
+            };
+            let mut att = [0u8; GENOME_LEN];
+            att[genome::ATTACK_POWER] = 255; // attack_range 0: reach 1
+            let attacker = make_cell_at(5, 5, Genome::new(att), 50.0);
+            let prey = make_cell_at(6, 5, make_genome(0), 40.0);
+            let (mut world, ids) = setup_world_with_cells(&config, vec![attacker, prey]);
+            let mut rng = ChaCha8Rng::seed_from_u64(3);
+            resolve_all(
+                &[
+                    (ids[0], Action::Attack(ids[1])),
+                    (ids[1], Action::Flee(flee_to.0, flee_to.1)),
+                ],
+                &mut world,
+                &config,
+                &mut rng,
+                &mut DecodeCache::default(),
+            );
+            let prey = world.get_cell(ids[1]);
+            (prey.position, prey.energy, world.stats.attacks_missed)
+        };
+
+        let (pos, energy, _) = run(false, (7, 5));
+        assert_eq!(pos, (6, 5), "without the switch the prey is pinned");
+        assert!(energy <= 0.0, "...and killed where it stood");
+
+        let (pos, energy, missed) = run(true, (7, 5));
+        assert_eq!(pos, (7, 5), "the prey should have got away");
+        assert_eq!(energy, 40.0, "a blow at an empty tile hurt the prey");
+        assert_eq!(missed, 1);
+
+        // A flight that stays inside the attacker's reach does not save it.
+        let (pos, energy, missed) = run(true, (6, 4));
+        assert_eq!(pos, (6, 4));
+        assert!(energy <= 0.0, "a prey still in reach was not hit");
+        assert_eq!(missed, 0);
+    }
+
+    #[test]
+    fn a_forager_can_steer_to_the_richest_food_rather_than_the_nearest_trace() {
+        let base = WorldConfig {
+            grid_width: 16,
+            grid_height: 16,
+            vent_count: 0,
+            initial_decay_matter: 0.0,
+            ..WorldConfig::default()
+        };
+        let mut world = World::new(&base);
+        let mut data = [0u8; GENOME_LEN];
+        data[genome::SCAVENGE_ABILITY] = 255;
+        data[genome::SENSE_RADIUS] = 255;
+        let id = world.spawn_cell(Cell::new(Genome::new(data), 50.0, (5, 5)));
+        world.set_current_tile_cell_id(5, 5, id);
+        let near = world.tile_index(6, 5);
+        let far = world.tile_index(8, 5);
+        world.current_grid_mut()[near].decay_energy = 0.5;
+        world.current_grid_mut()[far].decay_energy = 25.0;
+
+        let genes = Genome::new(data).decode(&base);
+        let nearest = sense(world.get_cell(id), &genes, &world, &base);
+        assert_eq!(nearest.nearest_food, Some((6, 5)));
+
+        let richest_cfg = WorldConfig {
+            food_targets_richest: true,
+            ..base.clone()
+        };
+        let richest = sense(world.get_cell(id), &genes, &world, &richest_cfg);
+        assert_eq!(
+            richest.nearest_food,
+            Some((8, 5)),
+            "steered to the trace, not the corpse"
+        );
+    }
+
+    /// The Move gate rolled against speed whatever a cell stood on, and the
+    /// food scan skips the cell's own tile, so chemotaxis even steered a
+    /// mobile scavenger off a fresh corpse toward the nearest trace. With
+    /// `foragers_stay_on_food` its own chemotaxis holds it on the meal, and
+    /// lets it go once the tile is eaten out.
+    #[test]
+    fn a_forager_stays_on_a_meal_and_leaves_an_empty_tile() {
+        let base = WorldConfig {
+            grid_width: 16,
+            grid_height: 16,
+            vent_count: 0,
+            initial_decay_matter: 0.0,
+            ..WorldConfig::default()
+        };
+        let mut data = [0u8; GENOME_LEN];
+        data[genome::SCAVENGE_ABILITY] = 255;
+        data[genome::SPEED] = 255;
+        data[genome::CHEMOTAXIS_STRENGTH] = 255;
+        data[genome::SENSE_RADIUS] = 128;
+        let moves = |config: &WorldConfig, underfoot: f32| {
+            let mut world = World::new(config);
+            let mut cell = Cell::new(Genome::new(data), 30.0, (5, 5));
+            cell.cooldown_remaining = 1; // no reproduction
+            let id = world.spawn_cell(cell);
+            world.set_current_tile_cell_id(5, 5, id);
+            let (here, trace) = (world.tile_index(5, 5), world.tile_index(7, 5));
+            world.current_grid_mut()[here].decay_energy = underfoot;
+            world.current_grid_mut()[trace].decay_energy = 2.0;
+            let genes = Genome::new(data).decode(config);
+            let sensed = sense(world.get_cell(id), &genes, &world, config);
+            let mut rng = ChaCha8Rng::seed_from_u64(9);
+            let cell = world.get_cell(id);
+            let n = (0..200)
+                .filter(|_| {
+                    matches!(
+                        decide(cell, &genes, &sensed, config, &mut rng),
+                        Action::Move(..)
+                    )
+                })
+                .count();
+            (n, sensed.own_food_share)
+        };
+
+        let (walked, _) = moves(&base, 25.0);
+        assert_eq!(walked, 200, "speed 255 moves every tick without the switch");
+
+        let stay = WorldConfig {
+            foragers_stay_on_food: true,
+            ..base.clone()
+        };
+        let (stayed, share) = moves(&stay, 25.0);
+        assert!((share - 25.0 / 27.0).abs() < 1e-4, "own share {share}");
+        assert!(
+            stayed < 40,
+            "walked off a 25-decay corpse {stayed}/200 times with a trace of 2 the best alternative"
+        );
+        let (left, share) = moves(&stay, 0.0);
+        assert_eq!(share, 0.0);
+        assert_eq!(left, 200, "an eaten-out tile should not hold the forager");
+    }
+
+    #[test]
+    fn offspring_scatter_places_a_child_beyond_the_parents_own_tile_ring() {
+        // spec.md gene 22, offspring_scatter: "distance from parent at which
+        // offspring spawns". The gene was never read — every child budded
+        // into an adjacent tile, so a lineage could only ever creep one tile
+        // per generation and clusters 128 tiles apart never met.
+        let config = WorldConfig {
+            grid_width: 32,
+            grid_height: 32,
+            vent_count: 0,
+            ..WorldConfig::default()
+        };
+        let mut data = [0u8; GENOME_LEN];
+        data[genome::SENSE_RADIUS] = 255;
+        data[genome::OFFSPRING_SCATTER] = 255;
+        let far = Genome::new(data).decode(&config);
+        data[genome::OFFSPRING_SCATTER] = 0;
+        let near = Genome::new(data).decode(&config);
+
+        assert!(
+            mapped_offspring_scatter(&far) > 1,
+            "a maxed offspring_scatter still only reaches {} tile(s)",
+            mapped_offspring_scatter(&far)
+        );
+        assert_eq!(mapped_offspring_scatter(&near), 1);
+
+        // And the gate really draws from the wider set.
+        let mut world = World::new(&config);
+        let id = world.spawn_cell(Cell::new(Genome::new(data), 200.0, (16, 16)));
+        world.set_current_tile_cell_id(16, 16, id);
+        let sensed = sense(world.get_cell(id), &far, &world, &config);
+        assert!(
+            sensed.empty_scatter.len() > sensed.empty_adjacent.len(),
+            "scatter set {} is no wider than the adjacent set {}",
+            sensed.empty_scatter.len(),
+            sensed.empty_adjacent.len()
+        );
+        assert!(
+            sensed
+                .empty_scatter
+                .iter()
+                .any(|&(x, y)| toroidal_dist(16, 16, x, y, 32, 32) > 1),
+            "no scatter target sits further than one tile from the parent"
+        );
+    }
+
+    #[test]
+    fn resolve_all_move_updates_position_for_next_tick() {
+        let config = small_config();
+        let cell = make_cell_at(5, 5, make_genome(128), 50.0);
+        let (mut world, ids) = setup_world_with_cells(&config, vec![cell]);
+        let mut rng = ChaCha8Rng::seed_from_u64(42);
+
+        resolve_all(
+            &[(ids[0], Action::Move(6, 5))],
+            &mut world,
+            &config,
+            &mut rng,
+            &mut DecodeCache::default(),
+        );
+        assert_eq!(world.get_cell(ids[0]).position, (6, 5));
+
+        // Next tick: an Idle cell must stay where it moved to, not snap back.
+        world.swap_buffers();
+        world.prepare_next();
+        resolve_all(
+            &[(ids[0], Action::Idle)],
+            &mut world,
+            &config,
+            &mut rng,
+            &mut DecodeCache::default(),
+        );
+        assert_eq!(world.next_tile(6, 5).cell_id, ids[0]);
+        assert_eq!(world.next_tile(5, 5).cell_id, 0);
+        assert_eq!(world.get_cell(ids[0]).position, (6, 5));
+    }
+
+    #[test]
     fn resolve_all_reproduce_creates_child() {
         let config = small_config();
         let mut data = [128u8; GENOME_LEN];
@@ -1606,7 +3024,13 @@ mod tests {
         let mut rng = ChaCha8Rng::seed_from_u64(42);
 
         let actions = vec![(ids[0], Action::Reproduce(6, 5))];
-        resolve_all(&actions, &mut world, &config, &mut rng);
+        resolve_all(
+            &actions,
+            &mut world,
+            &config,
+            &mut rng,
+            &mut DecodeCache::default(),
+        );
 
         // Parent should stay at original position
         assert_eq!(world.next_tile(5, 5).cell_id, ids[0]);
@@ -1619,6 +3043,42 @@ mod tests {
         let parent = world.get_cell(ids[0]);
         assert!(parent.energy < 100.0, "parent energy should decrease");
         assert!(parent.cooldown_remaining > 0, "cooldown should be set");
+    }
+
+    #[test]
+    fn resolve_all_move_does_not_overwrite_newborn() {
+        let config = small_config();
+        let mut data = [128u8; GENOME_LEN];
+        data[genome::OFFSPRING_ENERGY_SHARE] = 128;
+        let parent = make_cell_at(5, 5, Genome::new(data), 100.0);
+        let mover = make_cell_at(7, 5, make_genome(128), 50.0);
+        let (mut world, ids) = setup_world_with_cells(&config, vec![parent, mover]);
+        let mut rng = ChaCha8Rng::seed_from_u64(42);
+
+        // Both target (6, 5), which is empty in the current grid.
+        let actions = vec![
+            (ids[0], Action::Reproduce(6, 5)),
+            (ids[1], Action::Move(6, 5)),
+        ];
+        resolve_all(
+            &actions,
+            &mut world,
+            &config,
+            &mut rng,
+            &mut DecodeCache::default(),
+        );
+
+        let child_id = world.next_tile(6, 5).cell_id;
+        assert!(
+            child_id != 0 && child_id != ids[1],
+            "newborn must keep its tile"
+        );
+        assert_eq!(
+            world.next_tile(7, 5).cell_id,
+            ids[1],
+            "blocked mover stays put"
+        );
+        assert_eq!(world.get_cell(ids[1]).position, (7, 5));
     }
 
     #[test]
@@ -1638,7 +3098,13 @@ mod tests {
         let mut rng = ChaCha8Rng::seed_from_u64(42);
 
         let actions = vec![(ids[0], Action::Attack(ids[1])), (ids[1], Action::Idle)];
-        resolve_all(&actions, &mut world, &config, &mut rng);
+        resolve_all(
+            &actions,
+            &mut world,
+            &config,
+            &mut rng,
+            &mut DecodeCache::default(),
+        );
 
         let a = world.get_cell(ids[0]);
         let d = world.get_cell(ids[1]);
@@ -1647,6 +3113,176 @@ mod tests {
         // Both placed at original positions
         assert_eq!(world.next_tile(5, 5).cell_id, ids[0]);
         assert_eq!(world.next_tile(6, 5).cell_id, ids[1]);
+    }
+
+    #[test]
+    fn phase_offense_modifier_reaches_combat() {
+        // B7: resolve_all re-decoded genomes without phase modifiers, so the
+        // offense and defense phase groups had no effect on anything.
+        use crate::sim::genome::{BASE_GENE_COUNT, PHASE_OFFENSE_MOD};
+
+        let config = small_config();
+        let damage_with_phase = |phase: u8, offense_mod: u8| {
+            let mut att = [0u8; GENOME_LEN];
+            att[genome::ATTACK_POWER] = 200;
+            att[BASE_GENE_COUNT + PHASE_OFFENSE_MOD] = offense_mod;
+            let mut attacker = Cell::new(Genome::new(att), 100.0, (5, 5));
+            attacker.active_phase = phase;
+            let prey = Cell::new(make_genome(0), 5000.0, (6, 5));
+            let (mut world, ids) = setup_world_with_cells(&config, vec![attacker, prey]);
+            let mut rng = ChaCha8Rng::seed_from_u64(1);
+            resolve_all(
+                &[(ids[0], Action::Attack(ids[1]))],
+                &mut world,
+                &config,
+                &mut rng,
+                &mut DecodeCache::default(),
+            );
+            5000.0 - world.get_cell(ids[1]).energy
+        };
+
+        let base = damage_with_phase(0, 255);
+        let boosted = damage_with_phase(1, 255); // slot 0 active, offense x~2
+        let suppressed = damage_with_phase(1, 0); // slot 0 active, offense x0
+
+        assert!(
+            boosted > base,
+            "an offense phase should hit harder: {boosted} vs {base}"
+        );
+        assert!(
+            suppressed < base,
+            "a suppressing phase should hit softer: {suppressed} vs {base}"
+        );
+    }
+
+    #[test]
+    fn killing_feeds_the_killer() {
+        // Predation has to pay, or no predator can ever cover its upkeep.
+        let config = small_config();
+        let mut att = [0u8; GENOME_LEN];
+        att[genome::ATTACK_POWER] = 255;
+        att[genome::PREDATION_EFFICIENCY] = 255;
+        let attacker = make_cell_at(5, 5, Genome::new(att), 50.0);
+        let prey = make_cell_at(6, 5, make_genome(0), 40.0);
+        let (mut world, ids) = setup_world_with_cells(&config, vec![attacker, prey]);
+        let mut rng = ChaCha8Rng::seed_from_u64(42);
+
+        resolve_all(
+            &[(ids[0], Action::Attack(ids[1]))],
+            &mut world,
+            &config,
+            &mut rng,
+            &mut DecodeCache::default(),
+        );
+
+        assert!(!world.get_cell(ids[1]).is_alive(), "prey should die");
+        assert!(
+            world.get_cell(ids[0]).energy > 50.0,
+            "killer should absorb energy, has {}",
+            world.get_cell(ids[0]).energy
+        );
+    }
+
+    /// A kill paid `predation_efficiency` x the victim's whole store, the
+    /// gene has no antagonist, and whatever the killer did not take vanished.
+    /// `max_predation_efficiency` bounds the gene; with `corpses_keep_energy`
+    /// the uneaten part stays on the victim's tile as decay.
+    #[test]
+    fn a_capped_kill_pays_the_killer_its_share_and_leaves_the_rest_in_the_body() {
+        let config = WorldConfig {
+            max_predation_efficiency: 0.25,
+            corpses_keep_energy: true,
+            initial_decay_matter: 0.0,
+            ..small_config()
+        };
+        let mut att = [0u8; GENOME_LEN];
+        att[genome::ATTACK_POWER] = 255;
+        att[genome::PREDATION_EFFICIENCY] = 255;
+        let attacker = make_cell_at(5, 5, Genome::new(att), 50.0);
+        let prey = make_cell_at(6, 5, make_genome(0), 40.0);
+        let (mut world, ids) = setup_world_with_cells(&config, vec![attacker, prey]);
+        let mut rng = ChaCha8Rng::seed_from_u64(42);
+
+        resolve_all(
+            &[(ids[0], Action::Attack(ids[1]))],
+            &mut world,
+            &config,
+            &mut rng,
+            &mut DecodeCache::default(),
+        );
+
+        assert!(!world.get_cell(ids[1]).is_alive(), "prey should die");
+        // The prey cannot hit back (attack 0), so the killer's gain is the meal.
+        let gained = world.get_cell(ids[0]).energy - 50.0;
+        assert!(
+            (gained - 0.25 * 40.0).abs() < 1e-3,
+            "a maxed gene under a 0.25 cap should pay 10 of 40, paid {gained}"
+        );
+        let left = world.next_tile(6, 5).decay_energy;
+        assert!(
+            (left - 0.75 * 40.0).abs() < 1e-3,
+            "the 30 the killer did not take should lie on the corpse tile, found {left}"
+        );
+    }
+
+    #[test]
+    fn surviving_an_attack_feeds_nobody() {
+        let config = small_config();
+        let mut att = [0u8; GENOME_LEN];
+        att[genome::ATTACK_POWER] = 60;
+        att[genome::PREDATION_EFFICIENCY] = 255;
+        let attacker = make_cell_at(5, 5, Genome::new(att), 50.0);
+        let mut def = [0u8; GENOME_LEN];
+        def[genome::ARMOR] = 255; // shrugs it off
+        let prey = Cell::new(Genome::new(def), 200.0, (6, 5));
+        let (mut world, ids) = setup_world_with_cells(&config, vec![attacker, prey]);
+        let mut rng = ChaCha8Rng::seed_from_u64(42);
+
+        resolve_all(
+            &[(ids[0], Action::Attack(ids[1]))],
+            &mut world,
+            &config,
+            &mut rng,
+            &mut DecodeCache::default(),
+        );
+
+        assert!(world.get_cell(ids[1]).is_alive());
+        assert!(world.get_cell(ids[0]).energy <= 50.0, "no kill, no meal");
+    }
+
+    #[test]
+    fn kin_recognition_survives_top_n_gating() {
+        // Aggression and precision are mid-range, so neither is among the
+        // cell's dozen strongest genes and both decode to ~0.1x. A sibling
+        // 5% away must still read as kin, not as a threat.
+        let config = small_config();
+        let mut data = [250u8; GENOME_LEN];
+        data[genome::AGGRESSION_TRIGGER] = 120;
+        data[genome::KIN_RECOGNITION_PRECISION] = 120;
+        let genome = Genome::new(data);
+        let genes = genome.decode(&config);
+        let gated_trigger = genes.get(genome::AGGRESSION_TRIGGER)
+            * (0.5 + 0.5 * genes.get(genome::KIN_RECOGNITION_PRECISION));
+
+        // A sibling: 20 of 46 genes shifted by 41.
+        let mut sibling_data = data;
+        for b in sibling_data.iter_mut().take(20) {
+            *b -= 41;
+        }
+        let sibling = Genome::new(sibling_data);
+        let distance = genetic_distance(&genome, &sibling);
+        assert!(
+            distance > gated_trigger,
+            "precondition: gated trigger {gated_trigger} must be under sibling distance {distance}"
+        );
+
+        let cell = make_cell_at(5, 5, genome, 50.0);
+        let neighbour = make_cell_at(6, 5, sibling, 50.0);
+        let (world, ids) = setup_world_with_cells(&config, vec![cell, neighbour]);
+
+        let sensed = sense(world.get_cell(ids[0]), &genes, &world, &config);
+        assert_eq!(sensed.kin_count, 1, "sibling should read as kin");
+        assert_eq!(sensed.threat_count, 0);
     }
 
     #[test]
@@ -1670,7 +3306,13 @@ mod tests {
             (ids_a[1], Action::Move(8, 7)),
             (ids_a[2], Action::Idle),
         ];
-        resolve_all(&actions_a, &mut world_a, &config, &mut rng_a);
+        resolve_all(
+            &actions_a,
+            &mut world_a,
+            &config,
+            &mut rng_a,
+            &mut DecodeCache::default(),
+        );
 
         // Run with reversed order
         let (mut world_b, ids_b) = setup_world_with_cells(
@@ -1683,7 +3325,13 @@ mod tests {
             (ids_b[1], Action::Move(8, 7)),
             (ids_b[0], Action::Reproduce(4, 3)),
         ];
-        resolve_all(&actions_b, &mut world_b, &config, &mut rng_b);
+        resolve_all(
+            &actions_b,
+            &mut world_b,
+            &config,
+            &mut rng_b,
+            &mut DecodeCache::default(),
+        );
 
         // Compare next-grid state: same cells at same positions
         assert_eq!(
