@@ -1,0 +1,919 @@
+diff -ruN -x '*.orig' -x '*.rej' a/src/bin/lab.rs b/src/bin/lab.rs
+--- a/src/bin/lab.rs	1970-01-01 01:00:00.000000000 +0100
++++ b/src/bin/lab.rs	2026-09-27 03:15:45.734168256 +0100
+@@ -0,0 +1,487 @@
++// LAB harness: headless run with instrumentation.
++// Usage: lab [--config cfg.json] [--seed N] [--ticks N] [--every N] [--w N] [--h N]
++//            [--cells N] [--clusters N] [--uniform] [--phase-detail]
++// Output: one JSON object per report line on stdout.
++use primordium::config::{SeedStrategy, WorldConfig};
++use primordium::sim::Simulation;
++use primordium::sim::genome::{self, BASE_GENE_COUNT};
++use primordium::sim::phase::{TriggerCondition, decode_threshold};
++use primordium::sim::probe;
++use std::collections::BTreeMap;
++
++fn arg<T: std::str::FromStr>(args: &[String], k: &str) -> Option<T> {
++    args.iter().position(|a| a == k).and_then(|i| args.get(i + 1)).and_then(|v| v.parse().ok())
++}
++
++const CLASSES: [&str; 5] = ["photo", "thermo", "scav", "hunter", "none"];
++
++/// Classify a genome by its decoded (pre-phase) strategy genes.
++fn classify(g: &genome::DecodedGenes) -> usize {
++    let photo = g.get(genome::PHOTOSYNTHESIS_RATE);
++    let thermo = g.get(genome::THERMOSYNTHESIS_RATE);
++    let scav = g.get(genome::SCAVENGE_ABILITY);
++    let atk = g.get(genome::ATTACK_POWER);
++    if atk > 0.35 && atk >= photo && atk >= thermo && atk >= scav {
++        return 3;
++    }
++    let m = photo.max(thermo).max(scav);
++    if m < 0.1 {
++        return 4;
++    }
++    if photo == m { 0 } else if thermo == m { 1 } else { 2 }
++}
++
++/// Income vs upkeep for the four archetypes `preset_archetypes` actually
++/// seeds (`spawner::archetype_genome`), each in its own niche. This used to
++/// build its own lab-only genomes, which stopped matching the shipped designs.
++fn archetype_report(config: &WorldConfig) {
++    use primordium::sim::energy;
++    use primordium::sim::phase::apply_phase_modifiers;
++    use primordium::sim::spawner::{ARCHETYPES, Archetype, archetype_genome};
++    let prey = archetype_genome(Archetype::Photosynthesizer).decode(config);
++    let prey_armor = prey.get(genome::ARMOR) * 255.0;
++    for kind in ARCHETYPES {
++        let g = archetype_genome(kind);
++        let d = g.decode(config);
++        let cost = energy::metabolic_cost(&d, 128, config);
++        let cap = energy::storage_cap(&d, config);
++        let photo_full = energy::photo_income(d.get(genome::PHOTOSYNTHESIS_RATE), 255, config);
++        let thermo_40 = energy::thermo_income(d.get(genome::THERMOSYNTHESIS_RATE), config.vent_output, 40, 0, config.vent_cycle);
++        let (scav_corpse, _) = energy::scavenge_income(d.get(genome::SCAVENGE_ABILITY), config.corpse_biomass, config);
++        let mut hungry = d.clone();
++        apply_phase_modifiers(&mut hungry, &g, 1);
++        let sated_bite = (d.get(genome::ATTACK_POWER) * 255.0 - prey_armor).max(0.0);
++        let hungry_bite = (hungry.get(genome::ATTACK_POWER) * 255.0 - prey_armor).max(0.0);
++        println!("{{\"archetype\":\"{}\",\"upkeep\":{:.3},\"cap\":{:.1},\"speed\":{:.3},\"income\":{{\"photo_full_sun\":{:.3},\"thermo_40_per_vent\":{:.3},\"scav_one_corpse_tick\":{:.3}}},\"maturity_ticks\":{},\"cooldown_ticks\":{},\"armor\":{:.0},\"bite_vs_prey\":{{\"sated\":{:.0},\"hungry\":{:.0}}},\"runway_ticks\":{:.0}}}",
++            kind.name(), cost, cap, d.get(genome::SPEED),
++            photo_full, thermo_40, scav_corpse,
++            primordium::sim::actions::mapped_maturity_age(&d, config),
++            (d.get(genome::REPRODUCTION_COOLDOWN) * 100.0) as u32,
++            d.get(genome::ARMOR) * 255.0, sated_bite, hungry_bite, cap / cost);
++    }
++}
++
++/// Hue of an RGBA pixel, in degrees.
++fn hue_of(rgba: [u8; 4]) -> f32 {
++    let (r, g, b) = (rgba[0] as f32 / 255.0, rgba[1] as f32 / 255.0, rgba[2] as f32 / 255.0);
++    let max = r.max(g).max(b);
++    let min = r.min(g).min(b);
++    let d = max - min;
++    if d < 1e-6 { return 0.0; }
++    let h = if max == r { 60.0 * (((g - b) / d) % 6.0) }
++        else if max == g { 60.0 * ((b - r) / d + 2.0) }
++        else { 60.0 * ((r - g) / d + 4.0) };
++    h.rem_euclid(360.0)
++}
++
++fn hue_dist(a: f32, b: f32) -> f32 {
++    let d = (a - b).abs() % 360.0;
++    d.min(360.0 - d)
++}
++
++/// How far does colour move for a one-byte mutation, versus between two
++/// unrelated genomes? The old hash mapping scored 87.6 vs 90.0 degrees --
++/// a sibling was as different as a stranger.
++fn color_check(config: &WorldConfig) {
++    use primordium::render::color::{ColorMode, cell_to_rgba};
++    use primordium::sim::cell::Cell;
++    use primordium::sim::world::World;
++    use rand::{Rng, SeedableRng};
++
++    let mut rng = rand_chacha::ChaCha8Rng::seed_from_u64(7);
++    let mut world = World::new(config);
++    let mut sib_sum = 0.0f64;
++    let mut unrel_sum = 0.0f64;
++    let mut same_band = 0u32;
++    let n = 2000;
++
++    let hue_for = |world: &mut World, g: &genome::Genome, config: &WorldConfig| -> f32 {
++        let id = world.spawn_cell(Cell::new(g.clone(), 50.0, (0, 0)));
++        let idx = world.tile_index(0, 0);
++        world.current_grid_mut()[idx].cell_id = id;
++        let snap = world.snapshot(config);
++        let h = hue_of(cell_to_rgba(&snap.cells[0], ColorMode::Genetic));
++        world.current_grid_mut()[idx].cell_id = 0;
++        world.kill_cell(id);
++        h
++    };
++
++    for _ in 0..n {
++        let parent = primordium::sim::spawner::random_genome(&mut rng, config);
++        let mut sibling = parent.clone();
++        let i = rng.gen_range(0..genome::GENOME_LEN);
++        sibling.data[i] = sibling.data[i].wrapping_add(if rng.r#gen::<bool>() { 1 } else { 255 });
++        let stranger = primordium::sim::spawner::random_genome(&mut rng, config);
++
++        let hp = hue_for(&mut world, &parent, config);
++        let hs = hue_for(&mut world, &sibling, config);
++        let hu = hue_for(&mut world, &stranger, config);
++        sib_sum += hue_dist(hp, hs) as f64;
++        unrel_sum += hue_dist(hp, hu) as f64;
++        if hue_dist(hp, hs) < 45.0 { same_band += 1; }
++    }
++    println!("{{\"color_check\":{{\"mean_hue_shift_one_byte\":{:.1},\"mean_hue_shift_unrelated\":{:.1},\"siblings_in_same_band_pct\":{:.1}}}}}",
++        sib_sum / n as f64, unrel_sum / n as f64, same_band as f64 * 100.0 / n as f64);
++}
++
++/// Render what the window would show, to PPM files. Lets the view be
++/// checked without a compositor.
++fn render_frames(config: &WorldConfig, ticks: u64, shots: &[u64], prefix: &str) {
++    use primordium::render::Renderer;
++    use primordium::render::color::ColorMode;
++
++    let mut sim = Simulation::new(config.clone());
++    let mut renderer = Renderer::new(config.grid_width, config.grid_height);
++    let (w, h) = (config.grid_width as usize, config.grid_height as usize);
++
++    for t in 0..=ticks {
++        if t > 0 { sim.step(); }
++        if !shots.contains(&t) { continue; }
++        let snap = sim.snapshot();
++        for (name, mode) in [("genetic", ColorMode::Genetic), ("strategy", ColorMode::Strategy), ("phase", ColorMode::Phase), ("energy", ColorMode::Energy)] {
++            renderer.set_mode(mode);
++            let buf = renderer.render(&snap);
++            let mut out = format!("P6\n{} {}\n255\n", w, h).into_bytes();
++            for i in 0..(w * h) {
++                out.extend_from_slice(&buf[i * 4..i * 4 + 3]);
++            }
++            std::fs::write(format!("{prefix}-t{t}-{name}.ppm"), out).unwrap();
++        }
++        println!("{{\"tick\":{},\"pop\":{},\"wrote\":\"{}-t{}-*.ppm\"}}", t, snap.stats.population, prefix, t);
++    }
++}
++
++/// Carrying capacity per niche, in cells, against a reference upkeep.
++/// This is the sizing question section 5 hypothesis 3 asks about.
++fn niche_report(config: &WorldConfig) {
++    use primordium::sim::world::World;
++
++    let world = World::new(config);
++    let (w, h) = (config.grid_width as usize, config.grid_height as usize);
++
++    // Sunlight, as the empty world offers it (no shading yet).
++    let mut lit_tiles = 0u32;
++    let mut photo_total = 0f64;
++    for i in 0..(w * h) {
++        let sun = world.current_grid()[i].sunlight;
++        if sun > 0 { lit_tiles += 1; }
++        photo_total += config.photo_max_income as f64 * sun as f64 / 255.0;
++    }
++
++    // Vents: fixed output, shared among whoever is adjacent.
++    // Every tile a vent reaches, from the same definition the energy phase
++    // uses. This used to be `vents * 9`, i.e. the old one-tile reach.
++    let vent_tiles = (0..world.height as u16)
++        .flat_map(|y| (0..world.width as u16).map(move |x| (x, y)))
++        .filter(|&(x, y)| world.is_in_vent_zone(x, y, config.vent_radius))
++        .count();
++    let vent_total = config.vent_count as f64 * config.vent_output as f64;
++
++    // A lean specialist's upkeep, for converting energy into cells.
++    let mut d = [8u8; genome::GENOME_LEN];
++    d[genome::ENERGY_STORAGE_CAP] = 220;
++    d[genome::TEMPERATURE_PREFERENCE] = 128;
++    let upkeep = primordium::sim::energy::metabolic_cost(
++        &genome::Genome::new(d).decode(config), 128, config) as f64;
++
++    println!("{{\"niche\":{{\"upkeep_per_cell\":{:.2},\
++\"photo\":{{\"lit_tiles\":{},\"energy_per_tick\":{:.0},\"cells\":{:.0}}},\
++\"thermo\":{{\"vent_tiles\":{},\"energy_per_tick\":{:.0},\"cells\":{:.0}}},\
++\"grid_tiles\":{}}}}}",
++        upkeep,
++        lit_tiles, photo_total, photo_total / upkeep,
++        vent_tiles, vent_total, vent_total / upkeep,
++        w * h);
++}
++
++fn main() {
++    let args: Vec<String> = std::env::args().collect();
++    // Print WorldConfig::default() as JSON, so config files can be refreshed
++    // from the code instead of edited by hand every time a field is added.
++    if args.iter().any(|a| a == "--dump-config") {
++        println!("{}", serde_json::to_string_pretty(&WorldConfig::default()).unwrap());
++        return;
++    }
++    let mut config: WorldConfig = if let Some(path) = arg::<String>(&args, "--config") {
++        serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap()
++    } else {
++        WorldConfig { grid_width: 256, grid_height: 256, initial_cell_count: 2000, ..WorldConfig::default() }
++    };
++    if let Some(v) = arg(&args, "--seed") { config.seed = v; }
++    if let Some(v) = arg(&args, "--w") { config.grid_width = v; }
++    if let Some(v) = arg(&args, "--h") { config.grid_height = v; }
++    if let Some(v) = arg(&args, "--cells") { config.initial_cell_count = v; }
++    if let Some(v) = arg(&args, "--clusters") { config.cluster_count = v; }
++    if args.iter().any(|a| a == "--uniform") { config.initial_genome_strategy = SeedStrategy::RandomUniform; }
++    let ticks: u64 = arg(&args, "--ticks").unwrap_or(2000);
++    let every: u64 = arg(&args, "--every").unwrap_or(100);
++    let phase_detail = args.iter().any(|a| a == "--phase-detail");
++    if let Some(prefix) = arg::<String>(&args, "--render") {
++        let ticks: u64 = arg(&args, "--ticks").unwrap_or(500);
++        let shots: Vec<u64> = arg::<String>(&args, "--shots")
++            .unwrap_or_else(|| format!("0,10,{ticks}"))
++            .split(',').filter_map(|v| v.parse().ok()).collect();
++        render_frames(&config, ticks, &shots, &prefix);
++        return;
++    }
++    if args.iter().any(|a| a == "--niche") {
++        niche_report(&config);
++        return;
++    }
++    if args.iter().any(|a| a == "--color-check") {
++        color_check(&config);
++        return;
++    }
++    if args.iter().any(|a| a == "--archetypes") {
++        archetype_report(&config);
++        return;
++    }
++
++    let mut sim = Simulation::new(config.clone());
++    let h = config.grid_height as f32;
++    report(&sim, &probe::Probe::default(), 0, h, phase_detail);
++    let mut acc = probe::Probe::default();
++    for t in 1..=ticks {
++        sim.step();
++        let p = probe::take();
++        accumulate(&mut acc, &p);
++        if t % every == 0 || t == ticks {
++            report(&sim, &acc, every, h, phase_detail);
++            acc = probe::Probe::default();
++            if sim.world().live().is_empty() {
++                println!("{{\"extinct_at\":{}}}", t);
++                break;
++            }
++        }
++    }
++}
++
++fn accumulate(a: &mut probe::Probe, p: &probe::Probe) {
++    for i in 0..6 { a.actions[i] += p.actions[i]; }
++    a.births += p.births; a.repro_blocked += p.repro_blocked; a.attacks += p.attacks;
++    a.dmg_to_def += p.dmg_to_def; a.dmg_to_att += p.dmg_to_att; a.combat_kills += p.combat_kills;
++    a.combat_attacker_deaths += p.combat_attacker_deaths; a.deaths += p.deaths;
++    a.decay_deposited += p.decay_deposited; a.photo_in += p.photo_in; a.thermo_in += p.thermo_in;
++    a.scav_in += p.scav_in; a.metab += p.metab; a.venom_dmg += p.venom_dmg; a.toxin_dmg += p.toxin_dmg;
++    a.cap_waste += p.cap_waste; a.dormant += p.dormant; for i in 0..8 { a.phase_ns[i] += p.phase_ns[i]; } a.shared += p.shared; a.starve_deaths += p.starve_deaths;
++    a.sun_used_sum += p.sun_used_sum; a.sun_current_sum += p.sun_current_sum;
++    a.decay_used_sum += p.decay_used_sum; a.decay_current_sum += p.decay_current_sum;
++    a.energy_samples += p.energy_samples; a.phase_transitions += p.phase_transitions;
++    a.child_energy += p.child_energy;
++    a.same_lineage_attacks += p.same_lineage_attacks; a.attack_gdist_sum += p.attack_gdist_sum;
++    a.child_gdist_sum += p.child_gdist_sum; a.child_mutated_bytes += p.child_mutated_bytes;
++    a.move_err_sum += p.move_err_sum; a.move_err_n += p.move_err_n;
++    a.edge_move_err_sum += p.edge_move_err_sum; a.edge_move_err_abs_sum += p.edge_move_err_abs_sum;
++    a.edge_move_n += p.edge_move_n; a.interior_move_err_abs_sum += p.interior_move_err_abs_sum;
++}
++
++fn report(sim: &Simulation, p: &probe::Probe, window: u64, h: f32, phase_detail: bool) {
++    let world = sim.world();
++    let config = sim.config();
++    let live = world.live();
++    let n = live.len();
++    let mut class_n = [0u32; 5];
++    let mut class_y = [0f64; 5];
++    let mut class_e = [0f64; 5];
++    let mut lineages: BTreeMap<u16, u32> = BTreeMap::new();
++    let mut xtab: BTreeMap<(u16, u8), u32> = BTreeMap::new();
++    let mut phase_n = [0u32; 4];
++    let mut phase_cond: BTreeMap<&'static str, u32> = BTreeMap::new();
++    let mut raw_mean = [0f64; 64];
++    let mut dec_mean = [0f64; BASE_GENE_COUNT];
++    let mut energy_sum = 0f64;
++    let mut age_sum = 0f64;
++    let mut cap_sum = 0f64;
++    let mut slot_always_on = 0u32;
++    let mut mod_dev_active = 0f64;
++    let mut active_count = 0u32;
++    for &(_, c) in &live {
++        let d = c.genome.decode(config);
++        let k = classify(&d);
++        class_n[k] += 1;
++        class_y[k] += c.position.1 as f64 / h as f64;
++        class_e[k] += c.energy as f64;
++        *lineages.entry(c.lineage).or_default() += 1;
++        *xtab.entry((c.lineage, k as u8)).or_default() += 1;
++        phase_n[c.active_phase.min(3) as usize] += 1;
++        if c.active_phase > 0 {
++            let slot = (c.active_phase - 1) as usize;
++            let cond = TriggerCondition::from_byte(c.genome.phase_byte(slot, 0));
++            *phase_cond.entry(cond_name(cond)).or_default() += 1;
++            let mut dev = 0f64;
++            for off in 2..6 { dev += (c.genome.phase_byte(slot, off) as f64 - 128.0).abs(); }
++            mod_dev_active += dev / 4.0;
++            active_count += 1;
++        }
++        if decode_threshold(c.genome.phase_byte(0, 1)).threshold == 0.0 { slot_always_on += 1; }
++        for i in 0..64 { raw_mean[i] += c.genome.data[i] as f64; }
++        for i in 0..BASE_GENE_COUNT { dec_mean[i] += d.get(i) as f64; }
++        energy_sum += c.energy as f64;
++        age_sum += c.age as f64;
++        cap_sum += primordium::sim::energy::storage_cap(&d, config) as f64;
++    }
++    // Why can't these cells reproduce? Count failures per gate.
++    let (mut g_energy, mut g_cool, mut g_mature, mut g_space, mut g_ok) = (0u32, 0u32, 0u32, 0u32, 0u32);
++    let (mut mat_sum, mut life_sum, mut thr_sum) = (0f64, 0f64, 0f64);
++    for &(_, c) in &live {
++        let d = c.genome.decode(config);
++        let cap = primordium::sim::energy::storage_cap(&d, config);
++        let thr = (d.get(genome::REPRODUCTION_THRESHOLD) * cap).max(config.reproduction_energy_floor);
++        let mat = (d.get(genome::MATURITY_AGE) * 1000.0) as u32;
++        let life = primordium::sim::energy::lifespan_ticks(&d, config);
++        mat_sum += mat as f64; life_sum += life as f64; thr_sum += thr as f64;
++        if c.energy < thr { g_energy += 1; }
++        else if c.cooldown_remaining > 0 { g_cool += 1; }
++        else if c.age < mat { g_mature += 1; }
++        else { g_ok += 1; }
++        if mat >= life { g_space += 1; }
++    }
++    let nf = n.max(1) as f64;
++    let mut out = String::new();
++    out.push_str(&format!("{{\"tick\":{},\"pop\":{}", world.tick, n));
++    out.push_str(",\"class\":{");
++    for k in 0..5 {
++        out.push_str(&format!("{}\"{}\":[{},{:.2},{:.1}]", if k > 0 { "," } else { "" }, CLASSES[k], class_n[k],
++            class_y[k] / class_n[k].max(1) as f64, class_e[k] / class_n[k].max(1) as f64));
++    }
++    out.push('}');
++    let mut lin: Vec<(u16, u32)> = lineages.into_iter().collect();
++    lin.sort_by(|a, b| b.1.cmp(&a.1));
++    // Per-class diagnosis: what each strategy earns where it is standing,
++    // what it costs, and how close it is to reproducing. Grid-wide means are
++    // dominated by whichever class is most numerous, so a class that is
++    // quietly starving is invisible in them.
++    {
++        use primordium::sim::energy;
++        let mut n = [0u32; 5];
++        let (mut income, mut upkeep) = ([0f64; 5], [0f64; 5]);
++        let (mut tiledecay, mut efrac) = ([0f64; 5], [0f64; 5]);
++        let (mut speed, mut eligible) = ([0f64; 5], [0u32; 5]);
++        for &(_, c) in &live {
++            let d = c.genome.decode(config);
++            let k = classify(&d);
++            let (x, y) = c.position;
++            let t = world.current_tile(x, y);
++            let photo = energy::photo_income(d.get(genome::PHOTOSYNTHESIS_RATE), t.sunlight, config);
++            let (scav, _) = energy::scavenge_income(d.get(genome::SCAVENGE_ABILITY), t.decay_energy, config);
++            let vent = if world.is_in_vent_zone(x, y, config.vent_radius) {
++                energy::thermo_income(d.get(genome::THERMOSYNTHESIS_RATE), config.vent_output, 1, 0, config.vent_cycle)
++            } else { 0.0 };
++            let cost = energy::metabolic_cost(&d, t.temperature, config);
++            let cap = energy::storage_cap(&d, config);
++            n[k] += 1;
++            income[k] += (photo + scav + vent) as f64;
++            upkeep[k] += cost as f64;
++            tiledecay[k] += t.decay_energy as f64;
++            efrac[k] += (c.energy / cap.max(1.0)) as f64;
++            speed[k] += d.get(genome::SPEED) as f64;
++            let thr = (d.get(genome::REPRODUCTION_THRESHOLD) * cap).max(config.reproduction_energy_floor);
++            if c.energy >= thr { eligible[k] += 1; }
++        }
++        let mut parts: Vec<String> = Vec::new();
++        for k in 0..5 {
++            if n[k] == 0 { continue; }
++            let f = n[k] as f64;
++            parts.push(format!("\"{}\":{{\"n\":{},\"income\":{:.3},\"upkeep\":{:.3},\"net\":{:.3},\"tile_decay\":{:.2},\"energy_frac\":{:.2},\"speed\":{:.3},\"repro_ready_pct\":{:.1}}}",
++                CLASSES[k], n[k], income[k]/f, upkeep[k]/f, (income[k]-upkeep[k])/f,
++                tiledecay[k]/f, efrac[k]/f, speed[k]/f, eligible[k] as f64 * 100.0 / f));
++        }
++        out.push_str(&format!(",\"per_class\":{{{}}}", parts.join(",")));
++    }
++    {
++        let names = ["diffusion","sunlight","prepare_next","sense_decide","resolve","energy","cleanup"];
++        let total: u64 = p.phase_ns.iter().sum::<u64>().max(1);
++        let parts: Vec<String> = (0..7).map(|i| format!("\"{}\":{:.1}", names[i], p.phase_ns[i] as f64 * 100.0 / total as f64)).collect();
++        out.push_str(&format!(",\"phase_pct\":{{{}}},\"ms_per_tick\":{:.2}", parts.join(","), total as f64 / 1e6 / window.max(1) as f64));
++    }
++    out.push_str(&format!(",\"xtab\":{:?}", xtab.iter().map(|(&(l,c),&n)| [l as u32, c as u32, n]).collect::<Vec<_>>()));
++    out.push_str(&format!(",\"lineages\":{},\"top_lin\":{:?}", lin.len(), lin.iter().take(6).map(|&(a, b)| [a as u32, b]).collect::<Vec<_>>()));
++    out.push_str(&format!(",\"mean_energy\":{:.1},\"mean_cap\":{:.1},\"mean_age\":{:.1}", energy_sum / nf, cap_sum / nf, age_sum / nf));
++    out.push_str(&format!(",\"phase\":{:?},\"phase_cond\":{:?},\"slot0_always_on\":{:.3},\"active_mod_dev\":{:.1}",
++        phase_n, phase_cond, slot_always_on as f64 / nf, mod_dev_active / active_count.max(1) as f64));
++    if window > 0 {
++        let w = window as f64;
++        out.push_str(&format!(",\"per_tick\":{{\"births\":{:.1},\"deaths\":{:.1},\"starve\":{:.1},\"combat_kills\":{:.2},\"att_deaths\":{:.2},\"attacks\":{:.1},\"blocked_repro\":{:.1},\"phase_trans\":{:.1}}}",
++            p.births as f64 / w, p.deaths as f64 / w, p.starve_deaths as f64 / w, p.combat_kills as f64 / w,
++            p.combat_attacker_deaths as f64 / w, p.attacks as f64 / w, p.repro_blocked as f64 / w, p.phase_transitions as f64 / w));
++        let tot: u64 = p.actions.iter().sum();
++        let tf = tot.max(1) as f64;
++        out.push_str(&format!(",\"actions_pct\":[{:.1},{:.1},{:.1},{:.1},{:.1},{:.1}]",
++            p.actions[0] as f64 * 100.0 / tf, p.actions[1] as f64 * 100.0 / tf, p.actions[2] as f64 * 100.0 / tf,
++            p.actions[3] as f64 * 100.0 / tf, p.actions[4] as f64 * 100.0 / tf, p.actions[5] as f64 * 100.0 / tf));
++        let es = p.energy_samples.max(1) as f64;
++        out.push_str(&format!(",\"energy_per_cell_tick\":{{\"photo\":{:.3},\"thermo\":{:.3},\"scav\":{:.3},\"metab\":{:.3},\"venom\":{:.3},\"toxin\":{:.3},\"cap_waste\":{:.3},\"dormant_frac\":{:.3},\"combat_dmg\":{:.3},\"shared\":{:.3}}}",
++            p.photo_in / es, p.thermo_in / es, p.scav_in / es, p.metab / es, p.venom_dmg / es, p.toxin_dmg / es, p.cap_waste / es, p.dormant as f64 / es,
++            (p.dmg_to_def + p.dmg_to_att) / es, p.shared / es));
++        out.push_str(&format!(",\"env_probe\":{{\"sun_used\":{:.1},\"sun_current\":{:.1},\"decay_used\":{:.3},\"decay_current\":{:.3},\"decay_dep_per_death\":{:.3}}}",
++            p.sun_used_sum / es, p.sun_current_sum / es, p.decay_used_sum / es, p.decay_current_sum / es, p.decay_deposited / p.deaths.max(1) as f64));
++    }
++    if p.move_err_n > 0 {
++        let interior_n = p.move_err_n - p.edge_move_n;
++        out.push_str(&format!(
++            ",\"move_bias\":{{\"n\":{},\"mean_err\":{:.3},\"edge_n\":{},\"edge_mean_abs_err\":{:.3},\"interior_mean_abs_err\":{:.3}}}",
++            p.move_err_n,
++            p.move_err_sum / p.move_err_n as f64,
++            p.edge_move_n,
++            if p.edge_move_n > 0 { p.edge_move_err_abs_sum / p.edge_move_n as f64 } else { 0.0 },
++            if interior_n > 0 { p.interior_move_err_abs_sum / interior_n as f64 } else { 0.0 }
++        ));
++    }
++    out.push_str(&format!(
++        ",\"repro_gate\":{{\"blocked_energy\":{},\"blocked_cooldown\":{},\"blocked_immature\":{},\"eligible\":{},\"sterile_by_design\":{},\"mean_maturity\":{:.0},\"mean_lifespan\":{:.0},\"mean_threshold\":{:.1}}}",
++        g_energy, g_cool, g_mature, g_ok, g_space,
++        mat_sum / nf, life_sum / nf, thr_sum / nf));
++    // How many cells are in reach of a vent, and how far is the nearest one?
++    let bottom = world.height as i32 - 1;
++    let mut near_vent = 0u32;
++    let mut min_dist = i32::MAX;
++    for &(_, c) in &live {
++        let mut best = i32::MAX;
++        for &vx in &world.vent_positions {
++            let dx = (c.position.0 as i32 - vx as i32).abs().min(world.width as i32 - (c.position.0 as i32 - vx as i32).abs());
++            let dy = (c.position.1 as i32 - bottom).abs().min(world.height as i32 - (c.position.1 as i32 - bottom).abs());
++            best = best.min(dx.max(dy));
++        }
++        if best <= config.vent_radius as i32 { near_vent += 1; }
++        min_dist = min_dist.min(best);
++    }
++    out.push_str(&format!(",\"vents\":{{\"cells_adjacent\":{},\"nearest_cell_distance\":{}}}",
++        near_vent, if min_dist == i32::MAX { -1 } else { min_dist }));
++    let (mismatch, ghosts) = world.integrity();
++    out.push_str(&format!(",\"integrity\":{{\"pos_mismatch\":{},\"ghosts\":{}}}", mismatch, ghosts));
++    if window > 0 {
++        out.push_str(&format!(",\"genetics\":{{\"same_lineage_attack_frac\":{:.3},\"mean_attack_gdist\":{:.3},\"mean_child_gdist\":{:.4},\"mean_child_mutated_bytes\":{:.1}}}",
++            p.same_lineage_attacks as f64 / p.attacks.max(1) as f64, p.attack_gdist_sum / p.attacks.max(1) as f64,
++            p.child_gdist_sum / p.births.max(1) as f64, p.child_mutated_bytes as f64 / p.births.max(1) as f64));
++    }
++    let key = [0usize, 1, 3, 4, 5, 6, 12, 13, 17, 18, 21, 23, 32, 33];
++    out.push_str(",\"raw\":{");
++    for (j, &i) in key.iter().enumerate() {
++        out.push_str(&format!("{}\"{}\":{:.0}", if j > 0 { "," } else { "" }, i, raw_mean[i] / nf));
++    }
++    out.push_str("},\"dec\":{");
++    for (j, &i) in key.iter().enumerate() {
++        out.push_str(&format!("{}\"{}\":{:.3}", if j > 0 { "," } else { "" }, i, dec_mean[i] / nf));
++    }
++    out.push('}');
++    if phase_detail {
++        let mut cond_hist = [0u32; 8];
++        for &(_, c) in &live { for s in 0..3 { cond_hist[TriggerCondition::from_byte(c.genome.phase_byte(s, 0)) as usize] += 1; } }
++        out.push_str(&format!(",\"slot_cond_hist\":{:?}", cond_hist));
++    }
++    out.push('}');
++    println!("{}", out);
++}
++
++fn cond_name(c: TriggerCondition) -> &'static str {
++    match c {
++        TriggerCondition::EnergyLow => "energy_low",
++        TriggerCondition::EnergyHigh => "energy_high",
++        TriggerCondition::ThreatNearby => "threat",
++        TriggerCondition::KinNearby => "kin",
++        TriggerCondition::AgeMature => "age",
++        TriggerCondition::NoFood => "no_food",
++        TriggerCondition::Crowded => "crowded",
++        TriggerCondition::Wounded => "wounded",
++    }
++}
+diff -ruN -x '*.orig' -x '*.rej' a/src/lib.rs b/src/lib.rs
+--- a/src/lib.rs	1970-01-01 01:00:00.000000000 +0100
++++ b/src/lib.rs	2026-09-27 03:15:45.734202432 +0100
+@@ -0,0 +1,3 @@
++pub mod config;
++pub mod render;
++pub mod sim;
+diff -ruN -x '*.orig' -x '*.rej' a/src/sim/actions.rs b/src/sim/actions.rs
+--- a/src/sim/actions.rs	2026-09-27 03:15:45.731975831 +0100
++++ b/src/sim/actions.rs	2026-09-27 03:15:45.733813656 +0100
+@@ -1073,6 +1073,7 @@
+         if let Action::Reproduce(tx, ty) = *action {
+             // Target tile must still be empty in next grid
+             if world.next_tile(tx, ty).cell_id != 0 {
++                crate::sim::probe::with(|p| p.repro_blocked += 1);
+                 // Another reproduction already claimed this tile
+                 place_cell(world, cell_id, world.get_cell(cell_id).position);
+                 continue;
+@@ -1082,8 +1083,16 @@
+             let genes = effective_genes_cached(cell_id, parent, config, cache);
+             let pos = parent.position;
+ 
++            let parent_genome_copy = parent.genome.clone();
++            let parent_lineage = parent.lineage;
+             let outcome = resolve_reproduction(parent, &genes, (tx, ty), config, rng);
+ 
++            let mut outcome = outcome;
++            outcome.child.lineage = parent_lineage;
++            let cgd = genetic_distance(&parent_genome_copy, &outcome.child.genome) as f64;
++            let cmb = parent_genome_copy.data.iter().zip(outcome.child.genome.data.iter()).filter(|(a, b)| a != b).count() as u64;
++            crate::sim::probe::with(|p| { p.births += 1; p.child_energy += outcome.child.energy as f64; p.child_gdist_sum += cgd; p.child_mutated_bytes += cmb; });
++
+             // Place child in next grid
+             let child_id = world.spawn_cell(outcome.child);
+             cache.invalidate(child_id);
+@@ -1138,6 +1147,18 @@
+                 d.venom_damage = outcome.venom_damage;
+             }
+             let killed = !d.is_alive();
++            let att_dead = !world.get_cell(cell_id).is_alive();
++            let same_lin = world.get_cell(cell_id).lineage == world.get_cell(target_id).lineage;
++            let gd = genetic_distance(&world.get_cell(cell_id).genome, &world.get_cell(target_id).genome) as f64;
++            crate::sim::probe::with(|p| {
++                p.attacks += 1;
++                p.dmg_to_def += outcome.damage_to_defender as f64;
++                p.dmg_to_att += outcome.damage_to_attacker as f64;
++                p.attack_gdist_sum += gd;
++                if same_lin { p.same_lineage_attacks += 1; }
++                if killed { p.combat_kills += 1; }
++                if att_dead { p.combat_attacker_deaths += 1; }
++            });
+ 
+             // A kill feeds the killer: predation_efficiency of the victim's
+             // energy is absorbed. Without this, attacking was pure loss for
+@@ -1222,6 +1243,7 @@
+             let outcome = resolve_share(donor, &donor_genes, recipient);
+ 
+             // Apply energy changes
++            crate::sim::probe::with(|p| p.shared += (donor.energy - outcome.donor_energy) as f64);
+             world.get_cell_mut(cell_id).energy = outcome.donor_energy;
+             world.get_cell_mut(target_id).energy = outcome.recipient_energy;
+ 
+diff -ruN -x '*.orig' -x '*.rej' a/src/sim/cell.rs b/src/sim/cell.rs
+--- a/src/sim/cell.rs	2026-09-27 03:15:45.731466751 +0100
++++ b/src/sim/cell.rs	2026-09-27 03:15:45.733878900 +0100
+@@ -29,6 +29,8 @@
+     pub last_damage_tick: u32,
+     /// Remembered direction from sensing (persists for `memory_length` ticks)
+     pub memory_dir: (i8, i8),
++    /// LAB: founder lineage id (inherited)
++    pub lineage: u16,
+     /// Ticks `memory_dir` still counts for. Refreshed to the cell's
+     /// `memory_length` on every move and counted down otherwise, so
+     /// `docs/spec.md` gene 25's "0 = purely reactive" is literally true.
+@@ -52,6 +54,7 @@
+             active_phase: 0,
+             phase_ticks: 0,
+             cooldown_remaining: 0,
++            lineage: 0,
+             venom_ticks: 0,
+             venom_damage: 0,
+             last_damage_tick: 0,
+diff -ruN -x '*.orig' -x '*.rej' a/src/sim/energy.rs b/src/sim/energy.rs
+--- a/src/sim/energy.rs	2026-09-27 03:15:45.731415278 +0100
++++ b/src/sim/energy.rs	2026-09-27 03:15:45.733905708 +0100
+@@ -262,6 +262,9 @@
+     energy_fraction: f32,
+     config: &WorldConfig,
+ ) -> f32 {
++    if std::env::var_os("LAB_NO_DORMANCY").is_some() {
++        return 1.0;
++    }
+     let trigger = decoded.get(genome::DORMANCY_TRIGGER) * config.max_dormancy_trigger;
+     if trigger <= 0.0 || energy_fraction >= trigger {
+         return 1.0;
+@@ -330,19 +333,26 @@
+         0.0
+     };
+     let dormancy = dormancy_multiplier(&ctx.decoded, energy_fraction, config);
+-    cell.energy -= metabolic_cost(&ctx.decoded, ctx.tile_temperature, config) * dormancy;
++    let mc = metabolic_cost(&ctx.decoded, ctx.tile_temperature, config) * dormancy;
++    cell.energy -= mc;
++    crate::sim::probe::with(|p| { p.photo_in += photosynthesis_income as f64; p.thermo_in += ctx.vent_income as f64; p.scav_in += scavenge_income as f64; p.metab += mc as f64; if dormancy < 1.0 { p.dormant += 1; } });
+ 
+     if cell.venom_ticks > 0 {
+-        cell.energy -= venom_tick_damage(cell.venom_damage, ctx.decoded.get(genome::MEMBRANE));
++        let vd = venom_tick_damage(cell.venom_damage, ctx.decoded.get(genome::MEMBRANE));
++        crate::sim::probe::with(|p| p.venom_dmg += vd as f64);
++        cell.energy -= vd;
+         cell.venom_ticks -= 1;
+     }
+ 
+-    cell.energy -= toxin_tile_damage(
++    let td = toxin_tile_damage(
+         ctx.tile_toxin,
+         ctx.decoded.get(genome::TOXIN_RESISTANCE),
+         ctx.decoded.get(genome::MEMBRANE),
+     );
++    cell.energy -= td;
+ 
++    let waste = (cell.energy - max_energy).max(0.0);
++    crate::sim::probe::with(|p| { p.toxin_dmg += td as f64; p.cap_waste += waste as f64; });
+     cell.energy = cell.energy.min(max_energy);
+ 
+     // Senescence: old age kills regardless of how well fed the cell is.
+diff -ruN -x '*.orig' -x '*.rej' a/src/sim/mod.rs b/src/sim/mod.rs
+--- a/src/sim/mod.rs	2026-09-27 03:15:45.731265795 +0100
++++ b/src/sim/mod.rs	2026-09-27 03:15:45.733940511 +0100
+@@ -7,6 +7,7 @@
+ pub mod diffusion;
+ pub mod energy;
+ pub mod genome;
++pub mod probe;
+ pub mod phase;
+ pub mod spawner;
+ pub mod tick;
+@@ -74,6 +75,10 @@
+     // @veridikt
+     // purpose: "Expose a render-ready snapshot of the current world to the caller (the render thread)"
+     // triggers: World.snapshot
++    pub fn world(&self) -> &World { &self.world }
++    pub fn world_mut(&mut self) -> &mut World { &mut self.world }
++    pub fn config(&self) -> &WorldConfig { &self.config }
++
+     pub fn snapshot(&self) -> WorldSnapshot {
+         self.world.snapshot(&self.config)
+     }
+diff -ruN -x '*.orig' -x '*.rej' a/src/sim/probe.rs b/src/sim/probe.rs
+--- a/src/sim/probe.rs	1970-01-01 01:00:00.000000000 +0100
++++ b/src/sim/probe.rs	2026-09-27 03:15:45.733961602 +0100
+@@ -0,0 +1,58 @@
++// LAB-ONLY instrumentation. Thread-local counters incremented from the sim.
++use std::cell::RefCell;
++
++#[derive(Debug, Clone, Default)]
++pub struct Probe {
++    pub actions: [u64; 6], // Reproduce, Attack, Flee, Move, Share, Idle (chosen)
++    pub births: u64,
++    pub repro_blocked: u64,
++    pub attacks: u64,
++    pub dmg_to_def: f64,
++    pub dmg_to_att: f64,
++    pub combat_kills: u64,        // defenders pushed to <=0 by an attack
++    pub combat_attacker_deaths: u64, // attackers killed by retaliation
++    pub deaths: u64,
++    pub decay_deposited: f64,
++    pub photo_in: f64,
++    pub thermo_in: f64,
++    pub scav_in: f64,
++    pub metab: f64,
++    pub venom_dmg: f64,
++    pub toxin_dmg: f64,
++    pub cap_waste: f64,
++    pub dormant: u64,
++    pub phase_ns: [u64; 8],
++    pub shared: f64,
++    pub starve_deaths: u64,
++    pub sun_used_sum: f64,    // sunlight value energy step actually used (next grid)
++    pub sun_current_sum: f64, // sunlight on the current grid at same tile
++    pub decay_used_sum: f64,
++    pub decay_current_sum: f64,
++    pub energy_samples: u64,
++    pub phase_transitions: u64,
++    pub child_energy: f64,
++    pub same_lineage_attacks: u64,
++    pub attack_gdist_sum: f64,
++    pub child_gdist_sum: f64,
++    pub child_mutated_bytes: u64,
++    // Heading bias: signed angle between the chosen move and the genome's
++    // direction_bias, wrapped to (-pi, pi]. Split interior vs grid-edge cells.
++    pub move_err_sum: f64,
++    pub move_err_n: u64,
++    pub edge_move_err_sum: f64,
++    pub edge_move_err_abs_sum: f64,
++    pub edge_move_n: u64,
++    pub interior_move_err_abs_sum: f64,
++}
++
++thread_local! {
++    pub static PROBE: RefCell<Probe> = RefCell::new(Probe::default());
++}
++
++pub fn with<F: FnOnce(&mut Probe)>(f: F) {
++    PROBE.with(|p| f(&mut p.borrow_mut()));
++}
++
++pub fn take() -> Probe {
++    PROBE.with(|p| std::mem::take(&mut *p.borrow_mut()))
++}
+diff -ruN -x '*.orig' -x '*.rej' a/src/sim/spawner.rs b/src/sim/spawner.rs
+--- a/src/sim/spawner.rs	2026-09-27 03:15:45.731770144 +0100
++++ b/src/sim/spawner.rs	2026-09-27 03:15:45.733984145 +0100
+@@ -265,7 +265,8 @@
+             };
+ 
+             let energy = starting_energy(&genome, config);
+-            let cell = Cell::new(genome, energy, (x, y));
++            let mut cell = Cell::new(genome, energy, (x, y));
++            cell.lineage = cluster_idx as u16;
+             let cell_id = world.spawn_cell(cell);
+             world.set_current_tile_cell_id(x, y, cell_id);
+             placed += 1;
+@@ -545,6 +546,62 @@
+         d[base + genome::PHASE_OFFENSE_MOD] = 255;
+     }
+ 
++    if kind == Archetype::Predator {
++        if let Ok(v) = std::env::var("LAB_PRED_HUNGER") {
++            let b = BASE_GENE_COUNT;
++            d[b + genome::PHASE_TRIGGER_CONDITION] = 0; // EnergyLow
++            d[b + genome::PHASE_TRIGGER_THRESHOLD] = v.parse().unwrap();
++            d[b + genome::PHASE_OFFENSE_MOD] = 255;
++        }
++    }
++    // LAB: env-var overrides, so an archetype's design can be swept without
++    // a rebuild. `LAB_PRED_*` hit the predator, `LAB_PREY_*` the other three.
++    let predator = kind == Archetype::Predator;
++    for (var, idx, on_predator) in [
++        ("LAB_PRED_EFF", genome::PREDATION_EFFICIENCY, true),
++        ("LAB_PRED_ATTACK", genome::ATTACK_POWER, true),
++        ("LAB_PRED_MATURITY", genome::MATURITY_AGE, true),
++        ("LAB_PRED_COOLDOWN", genome::REPRODUCTION_COOLDOWN, true),
++        ("LAB_PREY_ARMOR", genome::ARMOR, false),
++        ("LAB_PREY_FLEE", genome::FLEE_RESPONSE, false),
++        ("LAB_PREY_MAXAGE", genome::MAX_AGE, false),
++    ] {
++        if on_predator != predator {
++            continue;
++        }
++        if let Ok(v) = std::env::var(var) {
++            d[idx] = v.parse().expect("LAB_* override must be a u8");
++        }
++    }
++
++    // LAB: env-var overrides for tuning the archetype design.
++    for (var, idx) in [
++        ("LAB_PRED_EFF", genome::PREDATION_EFFICIENCY),
++        ("LAB_ATTACK", genome::ATTACK_POWER),
++        ("LAB_PREY_ARMOR", usize::MAX),
++        ("LAB_MATURITY", genome::MATURITY_AGE),
++        ("LAB_FLEE", genome::FLEE_RESPONSE),
++    ] {
++        if let Ok(v) = std::env::var(var) {
++            let v: u8 = v.parse().unwrap();
++            match var {
++                "LAB_PRED_EFF" | "LAB_ATTACK" => {
++                    if kind == Archetype::Predator { d[idx] = v; }
++                }
++                "LAB_PREY_ARMOR" => {
++                    if kind != Archetype::Predator { d[genome::ARMOR] = v; }
++                }
++                "LAB_MATURITY" => {
++                    if kind == Archetype::Predator { d[idx] = v; }
++                }
++                "LAB_FLEE" => {
++                    if kind != Archetype::Predator { d[idx] = v; }
++                }
++                _ => {}
++            }
++        }
++    }
++
+     Genome::new(d)
+ }
+ 
+@@ -668,7 +725,8 @@
+             };
+ 
+             let energy = starting_energy(&genome, config);
+-            let cell = Cell::new(genome, energy, (x, y));
++            let mut cell = Cell::new(genome, energy, (x, y));
++            cell.lineage = ARCHETYPES.iter().position(|k| k == kind).unwrap() as u16;
+             let cell_id = world.spawn_cell(cell);
+             world.set_current_tile_cell_id(x, y, cell_id);
+         }
+diff -ruN -x '*.orig' -x '*.rej' a/src/sim/tick.rs b/src/sim/tick.rs
+--- a/src/sim/tick.rs	2026-09-27 03:15:45.731859917 +0100
++++ b/src/sim/tick.rs	2026-09-27 03:15:45.734038185 +0100
+@@ -52,23 +52,37 @@
+     cache: &mut DecodeCache,
+ ) {
+     cache.clear();
++    // LAB: per-phase wall time.
++    let mut clock = std::time::Instant::now();
++    let mut lap = |slot: usize| {
++        let ns = clock.elapsed().as_nanos() as u64;
++        crate::sim::probe::with(|p| p.phase_ns[slot] += ns);
++        clock = std::time::Instant::now();
++    };
+ 
+     // Phase 1: Diffusion & environment
+     diffusion::run_diffusion_phase(world, config);
++    lap(0);
+     world.update_sunlight(config.sunlight_gradient_strength);
++    lap(1);
+     world.prepare_next();
++    lap(2);
+ 
+     // Phase 2: Sensing + phase evaluation + decision
+     let actions = phase_sense_decide(world, config, rng, cache);
++    lap(3);
+ 
+     // Phase 3: Action resolution
+     actions::resolve_all(&actions, world, config, rng, cache);
++    lap(4);
+ 
+     // Phase 4: Energy update
+     phase_energy_update(world, config, cache);
++    lap(5);
+ 
+     // Phase 5: Cleanup
+     phase_cleanup(world, config, cache);
++    lap(6);
+ 
+     // Phase 6: Bookkeeping
+     world.swap_buffers();
+@@ -131,6 +145,7 @@
+         let cell_mut = world.get_cell_mut(cell_id);
+         actions::age_memory(cell_mut, &decoded);
+         if new_phase != cell_mut.active_phase {
++            crate::sim::probe::with(|p| p.phase_transitions += 1);
+             cell_mut.active_phase = new_phase;
+             cell_mut.phase_ticks = 0;
+         } else {
+@@ -143,6 +158,26 @@
+ 
+         // Decide action
+         let action = actions::decide(cell, &decoded, &sense, config, rng);
++        if let Action::Move(tx, ty) | Action::Flee(tx, ty) = action {
++            let (cx, cy) = cell.position;
++            let w = world.width as i32;
++            let h = world.height as i32;
++            let wrap_d = |a: i32, n: i32| { let d = a.rem_euclid(n); if d > n / 2 { d - n } else { d } };
++            let dx = wrap_d(tx as i32 - cx as i32, w) as f32;
++            let dy = wrap_d(ty as i32 - cy as i32, h) as f32;
++            let want = decoded.get(genome::DIRECTION_BIAS) * 2.0 * std::f32::consts::PI;
++            let mut err = dy.atan2(dx) - want;
++            let tau = 2.0 * std::f32::consts::PI;
++            err = err.rem_euclid(tau);
++            if err > std::f32::consts::PI { err -= tau; }
++            let on_edge = cx == 0 || cy == 0 || cx as i32 == w - 1 || cy as i32 == h - 1;
++            crate::sim::probe::with(|p| {
++                p.move_err_sum += err as f64; p.move_err_n += 1;
++                if on_edge { p.edge_move_err_sum += err as f64; p.edge_move_err_abs_sum += err.abs() as f64; p.edge_move_n += 1; }
++                else { p.interior_move_err_abs_sum += err.abs() as f64; }
++            });
++        }
++        crate::sim::probe::with(|p| { let i = match action { Action::Reproduce(..)=>0, Action::Attack(_)=>1, Action::Flee(..)=>2, Action::Move(..)=>3, Action::Share(_)=>4, Action::Idle=>5 }; p.actions[i]+=1; });
+         action_buffer.push((cell_id, action));
+     }
+ 
+@@ -233,8 +268,11 @@
+             vent_income: vent_lookup.get(&cell_id).copied().unwrap_or(0.0),
+         };
+ 
++        let cur = world.current_grid()[tile_idx];
++        crate::sim::probe::with(|p| { p.sun_used_sum += tile.sunlight as f64; p.sun_current_sum += cur.sunlight as f64; p.decay_used_sum += tile.decay_energy as f64; p.decay_current_sum += cur.decay_energy as f64; p.energy_samples += 1; });
+         let cell_mut = world.get_cell_mut(cell_id);
+         let result = energy::update_energy(cell_mut, &ctx, config);
++        if result.died { crate::sim::probe::with(|p| p.starve_deaths += 1); }
+         // Acclimate against the genome's own preference, not the already
+         // acclimated one written into `ctx.decoded` above.
+         energy::acclimate(
+@@ -288,6 +326,7 @@
+         // so scavengers had no food supply at all.
+         let decay_deposit =
+             config.corpse_biomass + cell.energy.max(0.0) * config.corpse_energy_fraction;
++        crate::sim::probe::with(|p| { p.deaths += 1; p.decay_deposited += decay_deposit as f64; });
+         // How long this body stays edible is its own decay_rate gene
+         // (spec.md 30). Where a tile already holds matter from an earlier
+         // corpse, blend the two rates by how much energy each brought.
+diff -ruN -x '*.orig' -x '*.rej' a/src/sim/world.rs b/src/sim/world.rs
+--- a/src/sim/world.rs	2026-09-27 03:15:45.731675948 +0100
++++ b/src/sim/world.rs	2026-09-27 03:15:45.734072743 +0100
+@@ -501,6 +501,33 @@
+     }
+ 
+     /// Total number of live cells (excluding sentinel).
++    /// LAB: (id, cell) for every living cell.
++    pub fn live(&self) -> Vec<(u32, &Cell)> {
++        (1..self.cells.len() as u32)
++            .filter(|&id| self.cells[id as usize].is_alive())
++            .map(|id| (id, &self.cells[id as usize]))
++            .collect()
++    }
++
++    /// LAB: (cells on tiles whose position field != tile coords, alive pool cells not on any tile)
++    pub fn integrity(&self) -> (u32, u32) {
++        let mut mismatch = 0;
++        let mut on_tile = vec![false; self.cells.len()];
++        for y in 0..self.height as u16 {
++            for x in 0..self.width as u16 {
++                let t = self.current_tile(x, y);
++                if t.cell_id != 0 {
++                    on_tile[t.cell_id as usize] = true;
++                    if self.cells[t.cell_id as usize].position != (x, y) { mismatch += 1; }
++                }
++            }
++        }
++        let ghosts = (1..self.cells.len())
++            .filter(|&i| self.cells[i].is_alive() && !on_tile[i])
++            .count() as u32;
++        (mismatch, ghosts)
++    }
++
+     pub fn population(&self) -> u32 {
+         (self.cells.len() as u32 - 1) - self.free_list.len() as u32
+     }
