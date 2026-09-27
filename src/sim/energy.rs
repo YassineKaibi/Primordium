@@ -1,18 +1,66 @@
+// @veridikt
+// kind: module
+// name: Energy
+// purpose: "The per-tick energy economy: income from photosynthesis/thermosynthesis/scavenging, metabolic drain, venom/toxin damage, storage cap, and death"
+// owner: "primordium-maintainers"
+// because: "Energy is the single selection currency — every gene a cell expresses costs energy to run, so the balance between income channels and metabolic_cost is what selection acts on"
+
 // Energy income (photo/thermo/scavenge), metabolic drain, starvation
 
 use crate::config::WorldConfig;
 use crate::sim::cell::Cell;
 use crate::sim::genome::{self, DecodedGenes};
+use crate::sim::stats::DeathCause;
 
-// ── Constants ──────────────────────────────────────────────────────
+// ── Storage capacity ───────────────────────────────────────────────
 
-/// Maximum energy a fully-specialized photosynthesizer earns per tick
-/// in full sunlight. Balances against metabolic_cost_exponent: a lean
-/// genome (~2-4 cost/tick) thrives, a generalist (~8-10) cannot.
-const PHOTO_MAX_INCOME: f32 = 4.0;
+/// Energy a cell can hold: `energy_cap_floor` plus the gene's share of the
+/// range up to `energy_cap_max`.
+///
+/// The floor matters. With a bare `gene * 255` most founders held less than
+/// one tick of income, so their spawn energy was clipped away on tick 1 and
+/// their reproduction threshold sat near zero.
 
-/// Fraction of consumed decay that becomes cell energy (energy sink).
-const SCAVENGE_EFFICIENCY: f32 = 0.9;
+// @veridikt
+// purpose: "Single definition of a cell's energy storage capacity from its decoded gene and the config floor/max"
+// because: "The cap bounds hoarding, clips income and sets the reproduction threshold, so all three must read one formula"
+pub fn storage_cap(decoded: &DecodedGenes, config: &WorldConfig) -> f32 {
+    let span = (config.energy_cap_max - config.energy_cap_floor).max(0.0);
+    config.energy_cap_floor + decoded.get(genome::ENERGY_STORAGE_CAP) * span
+}
+
+// ── Lifespan ───────────────────────────────────────────────────────
+
+/// Ticks a cell lives before dying of old age, from its `max_age` gene.
+
+// @veridikt
+// purpose: "Map the max_age gene onto an absolute lifespan between the configured min and max"
+// because: "docs/spec.md gene 32 is 'tick count before natural death'; without it a cell that reaches energy equilibrium never dies, never reproduces, and its colony freezes"
+pub fn lifespan_ticks(decoded: &DecodedGenes, config: &WorldConfig) -> u32 {
+    let span = config
+        .max_lifespan_ticks
+        .saturating_sub(config.min_lifespan_ticks) as f32;
+    config.min_lifespan_ticks + (decoded.get(genome::MAX_AGE) * span) as u32
+}
+
+// ── Corpse persistence ─────────────────────────────────────────────
+
+/// Per-tick fade fraction for the decay matter one corpse leaves behind.
+///
+/// `docs/spec.md` gene 30, `decay_rate`: "how long the cell's corpse
+/// persists as scavengeable decay matter". The gene scales the world's
+/// `decay_rate` between `corpse_decay_scale_min` and
+/// `corpse_decay_scale_max`, so a low gene is a tough body that stays
+/// edible far longer than the world average.
+
+// @veridikt
+// purpose: "Map a cell's decay_rate gene onto the per-tick fade of the decay matter its corpse leaves"
+// because: "Corpses are point sources that a scavenger has to walk to; how long one lasts decides whether the scavenger niche has any supply at all, and spec.md makes that a property of the dead cell rather than of the world"
+pub fn corpse_decay_fade(decoded: &DecodedGenes, config: &WorldConfig) -> f32 {
+    let span = config.corpse_decay_scale_max - config.corpse_decay_scale_min;
+    let scale = config.corpse_decay_scale_min + decoded.get(genome::DECAY_RATE) * span;
+    (config.decay_rate * scale).max(0.0)
+}
 
 // ── Photosynthesis ─────────────────────────────────────────────────
 
@@ -20,9 +68,13 @@ const SCAVENGE_EFFICIENCY: f32 = 0.9;
 ///
 /// `effective_rate`: decoded photosynthesis_rate gene (0.0..1.0)
 /// `tile_sunlight`: sunlight value on the cell's tile (0..255)
-pub fn photo_income(effective_rate: f32, tile_sunlight: u8) -> f32 {
+
+// @veridikt
+// purpose: "Photosynthesis income: scale the capped max income by the cell's effective rate and local sunlight"
+// because: "config.photo_max_income is tuned below a generalist's metabolic cost so photosynthesis only pays off for lean, specialized genomes"
+pub fn photo_income(effective_rate: f32, tile_sunlight: u8, config: &WorldConfig) -> f32 {
     let sunlight_norm = tile_sunlight as f32 / 255.0;
-    PHOTO_MAX_INCOME * effective_rate * sunlight_norm
+    config.photo_max_income * effective_rate * sunlight_norm
 }
 
 // ── Thermosynthesis ────────────────────────────────────────────────
@@ -37,6 +89,10 @@ pub fn photo_income(effective_rate: f32, tile_sunlight: u8) -> f32 {
 ///
 /// Returns energy gained this tick from the vent. Zero if vent is dormant
 /// or cell has no thermosynthesis gene.
+
+// @veridikt
+// purpose: "Thermal-vent income for cells adjacent to a vent, shared equally among all adjacent cells and gated by the vent's active/dormant cycle"
+// because: "Vent output is divided by adjacent_count, so crowding a vent dilutes everyone's share — this caps colony density at vents the way shade caps it at the surface"
 pub fn thermo_income(
     effective_rate: f32,
     vent_output: f32,
@@ -75,9 +131,19 @@ pub fn thermo_income(
 /// Returns `(income, decay_consumed)` — energy gained and how much
 /// decay to subtract from the tile. Decay consumed must not exceed
 /// what's available.
-pub fn scavenge_income(effective_ability: f32, tile_decay: f32) -> (f32, f32) {
-    let decay_consumed = (effective_ability * tile_decay).min(tile_decay);
-    (decay_consumed * SCAVENGE_EFFICIENCY, decay_consumed)
+
+// @veridikt
+// purpose: "Scavenge income from decay matter on the tile, returning both the energy gained and the decay to subtract"
+// because: "Scavenging is lossy (config.scavenge_efficiency) and bounded by available decay, so it is an energy sink that recycles dead biomass rather than free energy"
+pub fn scavenge_income(
+    effective_ability: f32,
+    tile_decay: f32,
+    config: &WorldConfig,
+) -> (f32, f32) {
+    let decay_consumed = (effective_ability * tile_decay)
+        .min(tile_decay)
+        .min(config.max_scavenge_per_tick);
+    (decay_consumed * config.scavenge_efficiency, decay_consumed)
 }
 
 // ── Metabolic cost ─────────────────────────────────────────────────
@@ -94,11 +160,16 @@ pub fn scavenge_income(effective_ability: f32, tile_decay: f32) -> (f32, f32) {
 /// `decoded`: effective gene values after all expression constraints
 /// `tile_temperature`: local tile temperature (0..255)
 /// `config`: world config (for exponent and temperature mismatch cost)
+
+// @veridikt
+// purpose: "Total per-tick energy drain: sum of each gene value raised to a superlinear exponent, plus a temperature-mismatch penalty"
+// because: "The superlinear exponent (default 1.5) is the core anti-supercell mechanic — maxing many genes costs disproportionately more than any income channel can supply, so generalists starve"
 pub fn metabolic_cost(decoded: &DecodedGenes, tile_temperature: u8, config: &WorldConfig) -> f32 {
     let mut base_cost = 0.0_f32;
     for &value in decoded.values.iter() {
         base_cost += value.powf(config.metabolic_cost_exponent);
     }
+    base_cost *= config.metabolic_cost_scale;
 
     let temp_norm = tile_temperature as f32 / 255.0;
     let pref = decoded.get(genome::TEMPERATURE_PREFERENCE);
@@ -131,6 +202,76 @@ pub fn toxin_tile_damage(tile_toxin: f32, toxin_resistance: f32, membrane: f32) 
     (tile_toxin * (1.0 - toxin_resistance) * (1.0 - membrane * 0.85)).max(0.0)
 }
 
+// ── Adaptation ─────────────────────────────────────────────────────
+
+/// A cell's effective temperature preference: its inherited gene plus the
+/// acclimation it has built up during its own life.
+pub fn acclimated_preference(decoded: &DecodedGenes, cell: &Cell) -> f32 {
+    (decoded.get(genome::TEMPERATURE_PREFERENCE) + cell.temp_acclimation).clamp(0.0, 1.0)
+}
+
+/// Move a cell's temperature acclimation one tick toward the temperature it is
+/// actually living at.
+///
+/// `docs/spec.md` gene 38, `adaptation_rate`: "speed of within-lifetime
+/// epigenetic-like modifier shifts. Not inherited." The spec names no target,
+/// and temperature is the one trait with an obvious one: a cell that sits in
+/// the wrong water pays `temperature_mismatch_cost` every tick, and
+/// acclimation lets it close that gap over its life at a rate its genome
+/// sets. The shift lives on the cell, not the genome, and every newborn starts
+/// at zero, so none of it is inherited.
+
+// @veridikt
+// purpose: "Close part of the gap between a cell's effective temperature preference and its tile's temperature each tick, at a rate set by its adaptation_rate gene"
+// because: "spec.md gene 38 is a within-lifetime, non-inherited modifier shift; temperature mismatch is the cost with a clear local target, so acclimation is where that shift has something to do"
+pub fn acclimate(
+    cell: &mut Cell,
+    inherited_preference: f32,
+    adaptation_rate: f32,
+    tile_temperature: u8,
+    config: &WorldConfig,
+) {
+    let rate = adaptation_rate * config.max_adaptation_rate;
+    if rate <= 0.0 {
+        return;
+    }
+    let target = tile_temperature as f32 / 255.0;
+    let current = (inherited_preference + cell.temp_acclimation).clamp(0.0, 1.0);
+    cell.temp_acclimation += (target - current) * rate;
+}
+
+// ── Dormancy ───────────────────────────────────────────────────────
+
+/// Is this cell dormant, and what does its metabolism cost while it is?
+///
+/// `docs/spec.md` gene 34, `dormancy_trigger`: "energy threshold below which
+/// the cell enters dormancy phase"; gene 35, `dormancy_cost`: "energy drain
+/// rate while in dormancy (lower = better hibernation)". Neither gene was
+/// read anywhere, so a starving cell had no way to ride out a famine and
+/// every lineage's runway was exactly `storage_cap / metabolic_cost`.
+///
+/// Returns the multiplier to apply to the cell's metabolic cost: 1.0 when
+/// awake, `dormancy_cost` when dormant. A dormant cell still pays its
+/// temperature mismatch and still takes venom and toxin damage — it is
+/// slowed, not sealed.
+
+// @veridikt
+// purpose: "Decide whether a cell is below its dormancy_trigger and return the metabolic multiplier that its dormancy_cost gene buys"
+// because: "Without it there is no way to survive a gap in the food supply, and the scavenger niche in particular cannot exist until the first corpses appear ~1300 ticks into a run"
+pub fn dormancy_multiplier(
+    decoded: &DecodedGenes,
+    energy_fraction: f32,
+    config: &WorldConfig,
+) -> f32 {
+    let trigger = decoded.get(genome::DORMANCY_TRIGGER) * config.max_dormancy_trigger;
+    if trigger <= 0.0 || energy_fraction >= trigger {
+        return 1.0;
+    }
+    decoded
+        .get(genome::DORMANCY_COST)
+        .clamp(config.min_dormancy_cost, 1.0)
+}
+
 // ── Energy update orchestrator ─────────────────────────────────────
 
 /// Context needed to update a cell's energy for one tick.
@@ -157,41 +298,108 @@ pub struct EnergyResult {
     pub decay_consumed: f32,
     /// Whether the cell died this tick
     pub died: bool,
+    /// Income by channel this tick: photosynthesis, vent, scavenging.
+    pub photo: f32,
+    pub thermo: f32,
+    pub scavenge: f32,
+    /// Metabolic cost actually paid (after any dormancy discount).
+    pub metabolism: f32,
+    pub venom: f32,
+    pub toxin: f32,
+    /// Energy above the storage cap, destroyed by the clamp.
+    pub cap_waste: f32,
+    pub dormant: bool,
+    /// Which drain took the cell to zero, when it died.
+    pub cause: Option<DeathCause>,
+    /// Energy the cell still held when senescence zeroed it; 0 for any cell
+    /// that did not die of old age this tick.
+    pub senesced_energy: f32,
 }
 
 /// Apply all energy income and costs to a cell for one tick.
 /// Mutates `cell.energy` in place. Returns info the caller needs.
+
+// @veridikt
+// purpose: "Settle one cell's energy for the tick: add all income, subtract metabolism + venom + toxin, clamp to storage cap, and flag death at <=0 (reporting what a cell dying of old age still held)"
+// because: "Order is income, then costs, then cap, then death-check — so a cell that earns a lot is still capped, and the storage cap (ENERGY_STORAGE_CAP gene) bounds hoarding"
+// assumes: "ctx.decoded already has phase modifiers applied by the caller, and ctx.vent_income was pre-computed from vent adjacency"
 pub fn update_energy(cell: &mut Cell, ctx: &EnergyContext, config: &WorldConfig) -> EnergyResult {
     let photosynthesis_income = photo_income(
         ctx.decoded.get(genome::PHOTOSYNTHESIS_RATE),
         ctx.tile_sunlight,
+        config,
     );
-    let (scavenge_income, decay_consumed) =
-        scavenge_income(ctx.decoded.get(genome::SCAVENGE_ABILITY), ctx.tile_decay);
+    let (scavenge_income, decay_consumed) = scavenge_income(
+        ctx.decoded.get(genome::SCAVENGE_ABILITY),
+        ctx.tile_decay,
+        config,
+    );
 
     cell.energy += photosynthesis_income + ctx.vent_income + scavenge_income;
 
-    cell.energy -= metabolic_cost(&ctx.decoded, ctx.tile_temperature, config);
+    // Dormancy is judged on the energy the cell holds *before* this tick's
+    // drain, so a cell that just fed its way back above the trigger wakes up
+    // in the same tick.
+    let max_energy = storage_cap(&ctx.decoded, config);
+    let energy_fraction = if max_energy > 0.0 {
+        cell.energy / max_energy
+    } else {
+        0.0
+    };
+    let dormancy = dormancy_multiplier(&ctx.decoded, energy_fraction, config);
+    let metabolism = metabolic_cost(&ctx.decoded, ctx.tile_temperature, config) * dormancy;
+    cell.energy -= metabolism;
+    // The first drain to reach zero is the cause; later ones only deepen it.
+    let mut cause = (cell.energy <= 0.0).then_some(DeathCause::Starvation);
 
+    let mut venom = 0.0;
     if cell.venom_ticks > 0 {
-        cell.energy -= venom_tick_damage(cell.venom_damage, ctx.decoded.get(genome::MEMBRANE));
+        venom = venom_tick_damage(cell.venom_damage, ctx.decoded.get(genome::MEMBRANE));
+        cell.energy -= venom;
         cell.venom_ticks -= 1;
+        if cause.is_none() && cell.energy <= 0.0 {
+            cause = Some(DeathCause::Venom);
+        }
     }
 
-    cell.energy -= toxin_tile_damage(
+    let toxin = toxin_tile_damage(
         ctx.tile_toxin,
         ctx.decoded.get(genome::TOXIN_RESISTANCE),
         ctx.decoded.get(genome::MEMBRANE),
     );
+    cell.energy -= toxin;
+    if cause.is_none() && cell.energy <= 0.0 {
+        cause = Some(DeathCause::Toxin);
+    }
 
-    let max_energy = ctx.decoded.get(genome::ENERGY_STORAGE_CAP) * 255.0;
+    let cap_waste = (cell.energy - max_energy).max(0.0);
     cell.energy = cell.energy.min(max_energy);
+
+    // Senescence: old age kills regardless of how well fed the cell is.
+    // What it still held is reported, for `corpses_keep_energy`: liveness is
+    // `energy > 0`, so the corpse itself cannot carry it to cleanup.
+    let mut senesced_energy = 0.0;
+    if cell.age >= lifespan_ticks(&ctx.decoded, config) {
+        senesced_energy = cell.energy.max(0.0);
+        cell.energy = 0.0;
+        cause = cause.or(Some(DeathCause::OldAge));
+    }
 
     let died = cell.energy <= 0.0;
 
     EnergyResult {
         decay_consumed,
         died,
+        photo: photosynthesis_income,
+        thermo: ctx.vent_income,
+        scavenge: scavenge_income,
+        metabolism,
+        venom,
+        toxin,
+        cap_waste,
+        dormant: dormancy < 1.0,
+        cause: if died { cause } else { None },
+        senesced_energy,
     }
 }
 
@@ -199,6 +407,116 @@ pub fn update_energy(cell: &mut Cell, ctx: &EnergyContext, config: &WorldConfig)
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// spec.md gene 38, adaptation_rate: "speed of within-lifetime
+    /// epigenetic-like modifier shifts. Not inherited." It was the one gene
+    /// nothing read.
+    #[test]
+    fn a_cell_acclimates_to_its_water_at_its_own_rate_and_passes_none_of_it_on() {
+        let config = WorldConfig::default();
+        let tile_temperature = 230u8; // warm water
+        let mut data = [0u8; genome::GENOME_LEN];
+        data[genome::TEMPERATURE_PREFERENCE] = 40; // a cold-water genome
+        let mismatch_after = |adaptation: u8, ticks: u32| {
+            let mut d = data;
+            d[genome::ADAPTATION_RATE] = adaptation;
+            let g = Genome::new(d);
+            let decoded = g.decode(&config);
+            let mut cell = Cell::new(g, 100.0, (0, 0));
+            for _ in 0..ticks {
+                acclimate(
+                    &mut cell,
+                    decoded.get(genome::TEMPERATURE_PREFERENCE),
+                    decoded.get(genome::ADAPTATION_RATE),
+                    tile_temperature,
+                    &config,
+                );
+            }
+            ((tile_temperature as f32 / 255.0) - acclimated_preference(&decoded, &cell)).abs()
+        };
+        let rigid = mismatch_after(0, 500);
+        let plastic = mismatch_after(255, 500);
+        assert!(
+            plastic < rigid * 0.5,
+            "acclimation closed {rigid:.3} only to {plastic:.3}"
+        );
+        // Nothing on the genome changed, and a newborn starts from zero.
+        assert_eq!(
+            Cell::new(Genome::new(data), 1.0, (0, 0)).temp_acclimation,
+            0.0
+        );
+    }
+
+    /// spec.md genes 34/35. Neither was read anywhere, so a starving cell
+    /// had no way to ride out a gap in its food supply.
+    /// A corpse has to last long enough to be a food source. Uncapped, a
+    /// maxed scavenger strips the whole tile on the tick it arrives, so
+    /// `corpse_biomass` 25 is one 22-energy meal against an upkeep of ~1.2,
+    /// and the niche only pays for a cell that can reach a fresh body every
+    /// tick — which, at a 1-tile-per-tick movement ceiling, none can.
+    #[test]
+    fn one_corpse_feeds_a_scavenger_for_several_ticks() {
+        let config = WorldConfig::default();
+        let mut decay = config.corpse_biomass;
+        let mut ticks = 0;
+        while decay > 0.01 && ticks < 1000 {
+            let (income, consumed) = scavenge_income(1.0, decay, &config);
+            assert!(consumed <= config.max_scavenge_per_tick + f32::EPSILON);
+            assert!(income > 0.0);
+            decay -= consumed;
+            ticks += 1;
+        }
+        assert!(
+            ticks >= 8,
+            "one corpse was gone in {ticks} tick(s); it is a meal, not a supply"
+        );
+    }
+
+    #[test]
+    fn a_dormant_cell_burns_less_and_outlives_one_that_cannot_hibernate() {
+        let config = WorldConfig::default();
+        let mut data = [40u8; genome::GENOME_LEN];
+        data[genome::DORMANCY_TRIGGER] = 0;
+        let awake = Genome::new(data).decode(&config);
+        data[genome::DORMANCY_TRIGGER] = 200; // shuts down below 78% full
+        data[genome::DORMANCY_COST] = 10; // and barely ticks over while down
+        let sleeper = Genome::new(data).decode(&config);
+
+        assert_eq!(dormancy_multiplier(&awake, 0.05, &config), 1.0);
+        let slowed = dormancy_multiplier(&sleeper, 0.05, &config);
+        assert!(
+            slowed < 1.0,
+            "a cell below its trigger still paid {slowed} of its upkeep"
+        );
+        // Above the trigger it is awake again.
+        assert_eq!(dormancy_multiplier(&sleeper, 0.99, &config), 1.0);
+
+        // And it really does last longer on the same starting energy.
+        let ticks_to_starve = |decoded: &DecodedGenes| {
+            let mut cell = Cell::new(Genome::new(data), 40.0, (0, 0));
+            let ctx = EnergyContext {
+                decoded: decoded.clone(),
+                tile_sunlight: 0,
+                tile_temperature: 128,
+                tile_toxin: 0.0,
+                tile_decay: 0.0,
+                vent_income: 0.0,
+            };
+            (1..100_000)
+                .find(|_| update_energy(&mut cell, &ctx, &config).died)
+                .unwrap_or(100_000)
+        };
+        // `min_dormancy_cost` caps the benefit at 1/0.25 = 4x on purpose:
+        // an arbitrarily cheap hibernator neither reproduces nor dies, so it
+        // just occupies a tile forever.
+        assert!(
+            ticks_to_starve(&sleeper) > ticks_to_starve(&awake) * 3 / 2,
+            "hibernating bought {} ticks against {} awake",
+            ticks_to_starve(&sleeper),
+            ticks_to_starve(&awake)
+        );
+    }
+
     use crate::sim::genome::BASE_GENE_COUNT;
 
     // ── Photosynthesis tests ────────────────────────────────────────
@@ -206,26 +524,26 @@ mod tests {
     #[test]
     fn photo_zero_in_dark_tile() {
         // No sunlight → no income regardless of gene value
-        assert!((photo_income(1.0, 0)).abs() < f32::EPSILON);
+        assert!((photo_income(1.0, 0, &default_config())).abs() < f32::EPSILON);
     }
 
     #[test]
     fn photo_zero_with_no_gene() {
         // Gene is 0 → no income regardless of sunlight
-        assert!((photo_income(0.0, 255)).abs() < f32::EPSILON);
+        assert!((photo_income(0.0, 255, &default_config())).abs() < f32::EPSILON);
     }
 
     #[test]
     fn photo_proportional_to_sunlight() {
-        let bright = photo_income(0.5, 200);
-        let dim = photo_income(0.5, 50);
+        let bright = photo_income(0.5, 200, &default_config());
+        let dim = photo_income(0.5, 50, &default_config());
         assert!(bright > dim, "bright ({bright}) should exceed dim ({dim})");
     }
 
     #[test]
     fn photo_proportional_to_rate() {
-        let high = photo_income(0.8, 128);
-        let low = photo_income(0.2, 128);
+        let high = photo_income(0.8, 128, &default_config());
+        let low = photo_income(0.2, 128, &default_config());
         assert!(
             high > low,
             "high rate ({high}) should exceed low rate ({low})"
@@ -234,7 +552,7 @@ mod tests {
 
     #[test]
     fn photo_max_gives_reasonable_value() {
-        let income = photo_income(1.0, 255);
+        let income = photo_income(1.0, 255, &default_config());
         // Max rate + max sunlight should give meaningful but not absurd income
         assert!(income > 0.0);
         assert!(income <= 255.0, "income {income} seems too high");
@@ -293,28 +611,28 @@ mod tests {
 
     #[test]
     fn scavenge_zero_with_no_gene() {
-        let (income, consumed) = scavenge_income(0.0, 10.0);
+        let (income, consumed) = scavenge_income(0.0, 10.0, &default_config());
         assert!(income.abs() < f32::EPSILON);
         assert!(consumed.abs() < f32::EPSILON);
     }
 
     #[test]
     fn scavenge_zero_on_empty_tile() {
-        let (income, consumed) = scavenge_income(1.0, 0.0);
+        let (income, consumed) = scavenge_income(1.0, 0.0, &default_config());
         assert!(income.abs() < f32::EPSILON);
         assert!(consumed.abs() < f32::EPSILON);
     }
 
     #[test]
     fn scavenge_extracts_proportional_amount() {
-        let (high_income, _) = scavenge_income(0.8, 10.0);
-        let (low_income, _) = scavenge_income(0.2, 10.0);
+        let (high_income, _) = scavenge_income(0.8, 10.0, &default_config());
+        let (low_income, _) = scavenge_income(0.2, 10.0, &default_config());
         assert!(high_income > low_income);
     }
 
     #[test]
     fn scavenge_consumed_does_not_exceed_available() {
-        let (_, consumed) = scavenge_income(1.0, 0.5);
+        let (_, consumed) = scavenge_income(1.0, 0.5, &default_config());
         assert!(
             consumed <= 0.5 + f32::EPSILON,
             "consumed {consumed} exceeds available 0.5"
@@ -324,10 +642,11 @@ mod tests {
     #[test]
     fn scavenge_income_is_fraction_of_consumed() {
         // Scavenging is lossy: cell absorbs 90% of what it removes
-        let (income, consumed) = scavenge_income(0.6, 5.0);
+        let (income, consumed) = scavenge_income(0.6, 5.0, &default_config());
         assert!(
-            (income - consumed * SCAVENGE_EFFICIENCY).abs() < f32::EPSILON,
-            "income ({income}) should be {SCAVENGE_EFFICIENCY}x consumed ({consumed})"
+            (income - consumed * default_config().scavenge_efficiency).abs() < f32::EPSILON,
+            "income ({income}) should be {}x consumed ({consumed})",
+            default_config().scavenge_efficiency
         );
     }
 
@@ -342,6 +661,125 @@ mod tests {
         DecodedGenes {
             values: [val; BASE_GENE_COUNT],
         }
+    }
+
+    #[test]
+    fn old_age_kills_a_well_fed_cell() {
+        // Without senescence a cell at energy equilibrium lives forever,
+        // never reproduces, and its colony freezes in place.
+        let config = default_config();
+        let mut genes = uniform_genes(0.03);
+        genes.values[genome::MAX_AGE] = 0.0; // shortest lifespan
+        genes.values[genome::ENERGY_STORAGE_CAP] = 1.0;
+
+        let ctx = EnergyContext {
+            decoded: genes,
+            tile_sunlight: 255,
+            tile_temperature: 128,
+            tile_toxin: 0.0,
+            tile_decay: 0.0,
+            vent_income: 0.0,
+        };
+
+        let mut young = Cell::new(Genome::new([8u8; genome::GENOME_LEN]), 200.0, (0, 0));
+        young.age = config.min_lifespan_ticks - 1;
+        assert!(!update_energy(&mut young, &ctx, &config).died);
+
+        let mut old = Cell::new(Genome::new([8u8; genome::GENOME_LEN]), 200.0, (0, 0));
+        old.age = config.min_lifespan_ticks;
+        assert!(
+            update_energy(&mut old, &ctx, &config).died,
+            "old age must kill"
+        );
+    }
+
+    /// The first drain that reaches zero is the cause of death, and a cell
+    /// that starves at the end of its lifespan died of starvation, not age.
+    #[test]
+    fn a_death_is_attributed_to_the_drain_that_caused_it() {
+        let config = default_config();
+        let mut genes = uniform_genes(0.03);
+        genes.values[genome::MAX_AGE] = 0.0;
+        // No dormancy, so a low-energy cell pays its full upkeep.
+        genes.values[genome::DORMANCY_TRIGGER] = 0.0;
+        let ctx = EnergyContext {
+            decoded: genes,
+            tile_sunlight: 0,
+            tile_temperature: 128,
+            tile_toxin: 0.0,
+            tile_decay: 0.0,
+            vent_income: 0.0,
+        };
+        let genome = || Genome::new([8u8; genome::GENOME_LEN]);
+
+        let mut fed = Cell::new(genome(), 100.0, (0, 0));
+        let r = update_energy(&mut fed, &ctx, &config);
+        assert!(!r.died && r.cause.is_none());
+        let upkeep = r.metabolism;
+        assert!(upkeep > 0.0);
+
+        let mut starving = Cell::new(genome(), upkeep * 0.5, (0, 0));
+        let r = update_energy(&mut starving, &ctx, &config);
+        assert_eq!(r.cause, Some(DeathCause::Starvation));
+
+        // Survives its upkeep by one unit, then venom finishes it.
+        let mut poisoned = Cell::new(genome(), upkeep + 1.0, (0, 0));
+        poisoned.venom_ticks = 3;
+        poisoned.venom_damage = 100;
+        let r = update_energy(&mut poisoned, &ctx, &config);
+        assert_eq!(r.cause, Some(DeathCause::Venom));
+
+        let mut old = Cell::new(genome(), 100.0, (0, 0));
+        old.age = config.min_lifespan_ticks;
+        assert_eq!(
+            update_energy(&mut old, &ctx, &config).cause,
+            Some(DeathCause::OldAge)
+        );
+
+        let mut old_and_starving = Cell::new(genome(), upkeep * 0.5, (0, 0));
+        old_and_starving.age = config.min_lifespan_ticks;
+        assert_eq!(
+            update_energy(&mut old_and_starving, &ctx, &config).cause,
+            Some(DeathCause::Starvation)
+        );
+    }
+
+    #[test]
+    fn lifespan_scales_with_the_gene() {
+        let config = default_config();
+        let short = lifespan_ticks(&uniform_genes(0.0), &config);
+        let long = lifespan_ticks(&uniform_genes(1.0), &config);
+        assert_eq!(short, config.min_lifespan_ticks);
+        assert_eq!(long, config.max_lifespan_ticks);
+    }
+
+    #[test]
+    fn storage_cap_has_a_floor_and_a_ceiling() {
+        let config = default_config();
+        let empty = uniform_genes(0.0);
+        let full = uniform_genes(1.0);
+        assert_eq!(storage_cap(&empty, &config), config.energy_cap_floor);
+        assert_eq!(storage_cap(&full, &config), config.energy_cap_max);
+        // A cell that can hold less than one tick of income cannot live.
+        assert!(storage_cap(&empty, &config) > config.photo_max_income);
+    }
+
+    #[test]
+    fn lean_specialist_earns_more_than_it_spends() {
+        // The feasibility floor of the whole economy: a cell expressing one
+        // acquisition gene and little else must profit in full sunlight.
+        let config = default_config();
+        let mut genes = uniform_genes(0.03);
+        genes.values[genome::PHOTOSYNTHESIS_RATE] = 1.0;
+        genes.values[genome::ENERGY_STORAGE_CAP] = 0.8;
+        genes.values[genome::TEMPERATURE_PREFERENCE] = 0.5;
+
+        let income = photo_income(1.0, 255, &config);
+        let cost = metabolic_cost(&genes, 128, &config);
+        assert!(
+            income > cost * 1.5,
+            "specialist income {income} must clear upkeep {cost} with room to grow"
+        );
     }
 
     #[test]
@@ -378,8 +816,9 @@ mod tests {
         let maxed = uniform_genes(1.0);
         let cost = metabolic_cost(&maxed, 128, &config);
         assert!(
-            cost > PHOTO_MAX_INCOME,
-            "all-max cost ({cost}) should exceed max photo income ({PHOTO_MAX_INCOME})"
+            cost > config.photo_max_income,
+            "all-max cost ({cost}) should exceed max photo income ({})",
+            config.photo_max_income
         );
     }
 
@@ -523,7 +962,7 @@ mod tests {
         update_energy(&mut cell, &ctx, &config);
         // energy_storage_cap gene is 0.5 (normalized). The max storage
         // should cap the cell's energy.
-        assert!(cell.energy <= 1000.0 + PHOTO_MAX_INCOME);
+        assert!(cell.energy <= 1000.0 + config.photo_max_income);
     }
 
     #[test]

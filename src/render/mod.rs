@@ -7,7 +7,7 @@
 
 pub mod color;
 
-use crate::render::color::genome_hash_to_rgba;
+use crate::render::color::{ColorMode, cell_to_rgba};
 use crate::sim::world::WorldSnapshot;
 
 /// Fixed-size RGBA framebuffer. Stateless today, but holds width/height so
@@ -15,11 +15,22 @@ use crate::sim::world::WorldSnapshot;
 pub struct Renderer {
     pub width: u32,
     pub height: u32,
+    /// What cell pixels encode. Switchable at runtime for debugging.
+    pub mode: ColorMode,
 }
 
 impl Renderer {
     pub fn new(width: u32, height: u32) -> Self {
-        Self { width, height }
+        Self {
+            width,
+            height,
+            mode: ColorMode::default(),
+        }
+    }
+
+    /// Switch what cell pixels encode (strategy, phase, energy, genetic).
+    pub fn set_mode(&mut self, mode: ColorMode) {
+        self.mode = mode;
     }
 
     /// Produce an `RGBA8` pixel buffer (`width * height * 4` bytes) from a
@@ -30,10 +41,10 @@ impl Renderer {
 
         self.fill_background(snapshot, &mut buf);
 
-        for &(x, y, hash) in &snapshot.cells {
-            let idx = (y as u32 * self.width + x as u32) as usize * 4;
+        for cell in &snapshot.cells {
+            let idx = (cell.y as u32 * self.width + cell.x as u32) as usize * 4;
             if idx + 4 <= buf.len() {
-                buf[idx..idx + 4].copy_from_slice(&genome_hash_to_rgba(hash));
+                buf[idx..idx + 4].copy_from_slice(&cell_to_rgba(cell, self.mode));
             }
         }
 
@@ -73,7 +84,7 @@ impl Renderer {
 mod tests {
     use super::*;
     use crate::sim::genome::GenomeHash;
-    use crate::sim::world::SimStats;
+    use crate::sim::world::{CellView, SimStats, Strategy};
 
     fn empty_snapshot(w: u32, h: u32) -> WorldSnapshot {
         let total = (w * h) as usize;
@@ -94,16 +105,42 @@ mod tests {
         assert_eq!(r.render(&snap).len(), 16 * 9 * 4);
     }
 
+    fn view_at(x: u16, y: u16) -> CellView {
+        CellView {
+            x,
+            y,
+            genome: GenomeHash(0x1234_5678),
+            strategy: Strategy::Photosynthesis,
+            specialization: 0.7,
+            energy_fraction: 0.6,
+            age_fraction: 0.2,
+            active_phase: 1,
+        }
+    }
+
     #[test]
-    fn cell_pixel_matches_genome_color() {
+    fn cell_pixel_matches_cell_color() {
         let r = Renderer::new(8, 8);
         let mut snap = empty_snapshot(8, 8);
-        let hash = GenomeHash(0x1234_5678);
-        snap.cells.push((3, 4, hash));
+        let cell = view_at(3, 4);
+        snap.cells.push(cell);
 
         let buf = r.render(&snap);
         let idx = (4 * 8 + 3) * 4;
-        assert_eq!(&buf[idx..idx + 4], &genome_hash_to_rgba(hash));
+        assert_eq!(&buf[idx..idx + 4], &cell_to_rgba(&cell, r.mode));
+    }
+
+    #[test]
+    fn switching_mode_changes_the_pixel() {
+        let mut r = Renderer::new(8, 8);
+        let mut snap = empty_snapshot(8, 8);
+        snap.cells.push(view_at(3, 4));
+        let idx = (4 * 8 + 3) * 4;
+
+        let genetic = r.render(&snap)[idx..idx + 4].to_vec();
+        r.set_mode(ColorMode::Phase);
+        let phase = r.render(&snap)[idx..idx + 4].to_vec();
+        assert_ne!(genetic, phase, "mode switch must change what is drawn");
     }
 
     #[test]
@@ -112,7 +149,7 @@ mod tests {
         // renderer must not panic if stale data arrives.
         let r = Renderer::new(4, 4);
         let mut snap = empty_snapshot(4, 4);
-        snap.cells.push((10, 10, GenomeHash(0)));
+        snap.cells.push(view_at(10, 10));
         let _ = r.render(&snap);
     }
 }
