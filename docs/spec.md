@@ -63,7 +63,7 @@ The simulation is deterministic: identical seeds produce identical outcomes. Thi
 
 | Index | Gene                 | Description                                                              |
 |-------|----------------------|--------------------------------------------------------------------------|
-| 23    | `sense_radius`       | Detection range in pixels (1-4). Higher values add metabolic cost.       |
+| 23    | `sense_radius`       | Detection range in pixels (1-4). Higher values add metabolic cost. The implementation maps it with `ceil(gene * 3)`, which tops out at 3; `full_sense_range` uses `ceil(gene * 4)` and reaches 4. |
 | 24    | `sense_priority`     | What the cell prioritizes detecting. 0 = food, 255 = threats. Gradient.  |
 | 25    | `memory_length`      | Ticks of directional memory. 0 = purely reactive.                        |
 | 26    | `signal_emission`    | Pheromone output strength per tick. Adds to local pheromone layer.        |
@@ -195,6 +195,8 @@ The genome has a finite expression capacity. The top N highest genes (N ~ 10-12 
 
 This forces evolutionary specialization: a cell can invest in ~10-12 strong traits, but cannot have 30+ high traits simultaneously. The choice of which genes to invest in defines the cell's ecological niche.
 
+Seven genes are only ever read from the raw genome bytes, never as expressed values: `mutation_rate`, `mutation_magnitude`, `gene_linkage`, `transposon_rate` and `horizontal_transfer` (read by mutation) and `aggression_trigger` and `kin_recognition_precision` (read by kin recognition). Their expressed values change nothing. With `raw_genes_outside_expression` they are left out of the ranking and out of the metabolic budget, so they neither take one of the N slots nor cost upkeep. Without it they rank and cost like any other gene: the archetype predator spends two of its twelve slots on the mutation genes, which gates its `max_age` down to a 401-tick life.
+
 Note: entropy-based penalty (continuous alternative) is planned for a later iteration.
 
 #### 3. Antagonistic Gene Pairs
@@ -268,7 +270,7 @@ Three channels for energy entering the system:
 Light enters from the top (y=0) and attenuates with depth following **Beer-Lambert law**: `I = I₀ · e^(-α · depth)`. Each tile has a per-tile absorption coefficient α composed of:
 
 - **Base water absorption** — clear water still absorbs some light (`sunlight_gradient_strength / grid_height` per row)
-- **Cell presence** — living cells occupying a tile block light (+0.2 α)
+- **Cell presence** — living cells occupying a tile block light (+`cell_light_absorption` α, default 0.2)
 - **Decay matter** — dead cell remains cloud the water (`decay_energy * 0.004`)
 - **Toxin** — pollution darkens the water (`toxin * 0.002`)
 - **Pheromone** — chemical signals add slight murkiness (`pheromone * 0.001`)
@@ -298,7 +300,7 @@ The vertical resource axis:
 
 #### Decay Matter
 
-Dead cells leave behind an energy deposit on their tile: `corpse_biomass` of structural matter plus `corpse_energy_fraction` of whatever energy remained. The structural part matters — a starved cell has no energy left but still has a body, and without it starvation deaths fed no one. With `corpses_keep_energy` this holds for every corpse: a cell that dies of old age leaves `corpse_energy_fraction` of the energy it still held (without the switch senescence zeroes that energy first, and an old corpse leaves only the biomass), and a killed cell's tile also receives whatever part of its pre-blow energy its killer did not absorb. Decays over time according to configurable `decay_rate`. Scavengers extract energy via `scavenge_ability`.
+Dead cells leave behind an energy deposit on their tile: `corpse_biomass` of structural matter plus `corpse_energy_fraction` of whatever energy remained (defaults 50 and 1.0: a fixed baseline plus all the energy the cell still held). The body grows with age: a corpse leaves `corpse_biomass * min(1, age / corpse_growth_ticks)` of it (default 100 ticks), so a newborn leaves little and an old cell the whole baseline. The baseline is energy that appears at death — the body was never paid for — so without growth a short life nets energy: at 50 starving young scavengers fed each other into a runaway by t=10 000, and at 75-100 within 2 000 ticks. The structural part matters — a starved cell has no energy left but still has a body, and without it starvation deaths fed no one. With `corpses_keep_energy` this holds for every corpse: a cell that dies of old age leaves `corpse_energy_fraction` of the energy it still held (without the switch senescence zeroes that energy first, and an old corpse leaves only the biomass), and a killed cell's tile also receives whatever part of its pre-blow energy its killer did not absorb. Decays over time according to configurable `decay_rate`. With `decay_sink_rate` > 0 that share of each tile's decay sinks one row toward the vents every tick (settling on the bottom row, not wrapping), so the deaths in the photic band rain onto the rows below. Scavengers extract energy via `scavenge_ability`.
 
 Creates a nutrient cycle: predators kill, remains feed scavengers, scavengers die, new remains appear.
 
@@ -353,7 +355,7 @@ After diffusion, sunlight is recomputed via a Beer-Lambert column scan (see Sunl
 
 Each world step processes in this order:
 
-1. **Decay phase** -- pheromone fades/diffuses, toxin fades/diffuses, temperature diffuses, decay matter fades, sunlight recomputed (Beer-Lambert column scan)
+1. **Decay phase** -- pheromone fades/diffuses, toxin fades/diffuses, temperature diffuses, decay matter fades (and sinks, with `decay_sink_rate`), sunlight recomputed (Beer-Lambert column scan)
 2. **Sensing phase** -- each cell reads local tile + neighbors within `sense_radius`, determines current phase state
 3. **Decision phase** -- each cell selects an action (move, attack, reproduce, share energy, idle) based on genome, active phase modifiers, and sensed environment
 4. **Action resolution** -- all actions resolved simultaneously from double-buffered state. Conflicts (two cells targeting same tile, mutual attacks) resolved by deterministic rules
@@ -373,6 +375,7 @@ Simultaneous resolution ensures no cell has an advantage from processing order. 
 | `vent_radius`                   | How far a vent's output reaches, in tiles              |
 | `vent_cycle`                    | Erupt/dormant period. 0 = always on                   |
 | `decay_rate`                    | Speed at which remains lose energy                     |
+| `decay_sink_rate`               | Share of each tile's decay that sinks one row per tick (0 = stays put) |
 | `initial_decay_matter`          | Detritus every tile starts with, so scavengers have food at tick 0 |
 | `max_scavenge_per_tick`         | Cap on decay one cell can strip from a tile in one tick |
 | `max_dormancy_trigger`          | Highest energy fraction a `dormancy_trigger` of 255 can mean |
@@ -391,6 +394,7 @@ Simultaneous resolution ensures no cell has an advantage from processing order. 
 | `archetype_band_depth`          | Rows per preset_archetypes band; 0 derives it from the band's population |
 | `archetype_population_shares`   | How initial_cell_count splits between the four archetypes |
 | `metabolic_cost_scale`          | Multiplier on the summed per-gene expression cost      |
+| `raw_genes_outside_expression`  | The seven raw-read genes take no top-N slot and cost no upkeep |
 | `photo_max_income`              | Income of a perfect photosynthesizer in full sunlight   |
 | `scavenge_efficiency`           | Fraction of consumed decay matter that becomes energy   |
 | `energy_cap_floor`              | Storage capacity when `energy_storage_cap` is 0        |
@@ -402,10 +406,13 @@ Simultaneous resolution ensures no cell has an advantage from processing order. 
 | `max_mutation_magnitude`        | Largest byte shift when `mutation_magnitude` is 255     |
 | `max_adaptation_rate`           | Share of the temperature gap closed per tick at `adaptation_rate` 255 |
 | `max_move_distance`             | Furthest a move goes in one tick; 1 is one tile per tick |
-| `attack_only_when_harmful`      | Attack only a threat whose armour the blow can beat; otherwise flee |
+| `attack_only_when_harmful`      | Attack only a threat the blow can get through the armour of, or the venom through the membrane of; otherwise flee |
+| `full_sense_range`              | `sense_radius` spans the spec's 1-4 tiles instead of 1-3 |
+| `satiation_fraction`            | Above this share of its storage cap a cell starts no attack (1.0 = off) |
+| `cell_light_absorption`         | Absorption α one occupied tile adds to its light column (0.2) |
 | `flee_can_escape`               | Flee takes a speed roll, only from threats that can hurt, and movement resolves before blows land |
 | `food_targets_richest`          | Steer toward the richest food in range rather than the nearest |
-| `foragers_stay_on_food`         | A cell on food moves less, by its chemotaxis times its own tile's share of the food around |
+| `foragers_stay_on_food`         | A cell on food moves less, by its chemotaxis times its own tile's share of the food around (on by default) |
 | `max_transposon_rate`           | Chance per birth of a transposon event at `transposon_rate` 255 |
 | `max_horizontal_transfer`       | Chance per kill of absorbing a victim gene at `horizontal_transfer` 255 |
 | `corpse_decay_scale_min`        | Multiplier on `decay_rate` for a corpse whose `decay_rate` gene is 0 |
@@ -416,7 +423,8 @@ Simultaneous resolution ensures no cell has an advantage from processing order. 
 | `maturity_lifespan_fraction`    | Cap on maturity as a share of the cell's own lifespan   |
 | `corpse_biomass`                | Structural decay matter every corpse leaves behind      |
 | `corpse_energy_fraction`        | Share of a corpse's remaining energy that becomes decay |
-| `corpses_keep_energy`           | An old corpse keeps its energy, and a kill's uneaten part stays on the victim's tile |
+| `corpse_growth_ticks`           | Ticks a body takes to grow to the full `corpse_biomass` (100; 0 = every body is full) |
+| `corpses_keep_energy`           | An old corpse keeps its energy, and a kill's uneaten part stays on the victim's tile (on by default) |
 | `max_predation_efficiency`      | Share of a victim's energy a kill pays at `predation_efficiency` 255 |
 
 ### Initial Seeding Strategies
