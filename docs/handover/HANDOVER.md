@@ -1,10 +1,10 @@
 # Handover: species balance and phase visibility
 
-## Start here (2026-09-27, updated after step 16)
+## Start here (2026-09-29, updated after step 20)
 
 **Problem:** the world can't sustain more than one way of living — photosynthesizers
 take over, scavengers and predators die — and the window shows life only in a thin
-strip. Steps 1–16 below record every fix with its before/after measurement.
+strip. Steps 1–20 below record every fix with its before/after measurement.
 
 **Step 15 changed how things are measured — read it first.** The harness is no longer
 a patch: it is `src/bin/lab` (`cargo run --release --bin lab`), reading counters the
@@ -46,26 +46,66 @@ each judged by whether a consumer's grow-from-rare rate flips. **None flips.**
    invasion cannot be reached by #2 or #4 (sessile invader, dead before the first
    old-age corpses at t≈1316). A **mobile** scavenger grows from rare (r = +0.44) and
    then crashes on its own boom; with kept energy + staying, 3/6 seeds persist.
-5. Proposed default flips (not made): `corpses_keep_energy`, `foragers_stay_on_food`.
+5. Proposed default flips (made in step 17): `corpses_keep_energy`, `foragers_stay_on_food`.
 
-**Remains:**
-0. After step 16: measure the predator's reproduction brake (gated `max_age` →
-   401-tick life, maturity capped at half of it, cooldown 100) against its energy;
-   decide whether the scavenger assay should use a mobile invader or a later `--at`
-   (after the old-age wave), since the sessile one at t=1000 cannot see corpse
-   changes at all; fix `attack_only_when_harmful` ignoring venom before judging it.
-1. The predator has no niche from rare (item 3). Step 16 tried two of the approach
-   review's levers, capping trophic transfer and making Flee real: the cap makes it
-   worse and Flee changes nothing. The third, what keeps maturity from sliding, is
-   now item 0.
-2. Scavengers need decay they can reach (item 4). Step 16 built staying on food and
-   routing a kill's uneaten energy (and old corpses' energy) to decay; letting decay
-   move (sink) is untried.
-3. Life confined to ~9–35 rows: each occupied tile absorbs 0.2 of the light below it
-   (hard-coded in `world::tile_absorption`, not yet in config).
-4. Movement switches: `max_move_distance` and `food_targets_richest` still
-   unmeasured; `attack_only_when_harmful` measured in step 16 (archetype hunters
-   +36 ± 21), but it ignores venom and sense radius never exceeds 3 — fix first.
+**What step 17 changed and measured** (full tables there):
+1. `corpses_keep_energy` and `foragers_stay_on_food` default to true (hash-identical
+   to step 16 with both on). New baseline: predator r −0.00148, scavenger −0.00293.
+2. `--invade` now reports where invaders spend their time against the reproduction
+   gate and a life table with `r0_estimate` (births per newborn per lifetime), which
+   r while rare cannot give for a lineage that outlives the window.
+3. **The predator's binding brake is its lifespan.** 98% of its mature time is below
+   the reproduction threshold (energy sets one birth per ~240 adult ticks; the
+   cooldown alone blocks 1.5%), but top-N gating leaves `max_age` unexpressed, so it
+   has a 201-tick adult life: R0 0.57. Expressing `max_age` (lifespan 1 475) flips r
+   positive on 6/6 seeds (R0 2.6–2.75), also with the upkeep saving paid back.
+   Maturity 130 or an expressed offspring share reach R0 ~0.9; cooldown 50 0.72.
+   Two of its 12 expression slots hold mutation genes whose decoded values nothing
+   reads.
+4. The late (t=1400) scavenger invasion is the first assay that sees kept corpse
+   energy (sessile passes the rare cap 5/6 vs 0/6), but every scavenger arm still
+   booms and busts.
+
+**What step 18 changed and measured** (full table there): option A, behind
+`raw_genes_outside_expression` (default off, knob-off bit-identical). The seven
+genes read only raw take no top-N slot and cost no upkeep. The predator then
+replaces itself from rare (r +0.00158, 6/6 grew, R0 3.21) and the default world
+is unchanged within noise, but **the archetype world goes extinct on 10/10 seeds
+by t=650–750**: its four-way persistence depended on all 1 250 founder predators
+dying of old age at t≈401. Not flipped.
+
+**What step 19 changed and measured** (full tables there): the rest of the list.
+Four new default-off knobs (`full_sense_range`, `cell_light_absorption`,
+`decay_sink_rate`, and venom in `attack_only_when_harmful`), all bit-identical
+off. **Nothing measured improves persistence or flips an invasion; no default
+change is proposed.** A self-replacing predator crashes the archetype web from
+every starting share (25% → 1%), so the sim lacks a stabilising mechanism. The
+sessile scavenger is supply-limited: sinking decay only makes bigger booms, and
+braked scavengers die out without booming.
+
+**What step 20 changed and measured** (full tables there): the user's four
+decisions. Satiation (`satiation_fraction`, off) makes predators better hunters,
+not restrained ones: hunters are lost on 10/10 archetype seeds. Corpses are now
+baseline 50 + all remaining energy, with a body that grows over 100 ticks
+(`corpse_growth_ticks`), in the defaults and `archetypes.json`: without growth
+the 50 baseline ran away on 1 of 5 default seeds by t=10 000 (a starvation pump);
+with it there is no runaway and a sessile scavenger introduced at t=1400 persists
+to t=2000 on 6/6 seeds, though most of the scavenger gain is gone. Packed
+colonies are closed as intended. The 10k table: no default seed dies, none keeps
+hunters.
+
+**Remains:** (after step 20)
+1. **Corpses** are settled (50 + full energy, growth 100). Open: the 10k
+   archetype arm with growth lost 3/5 seeds (old values 1/5); a 10-seed 10k run
+   would say whether that is noise.
+2. **Predator stabilisation**: satiation did not work (step 20). What limits a
+   predator's *numbers* (interference between predators, a prey refuge) is
+   untried; `raw_genes_outside_expression` stays off until something works.
+3. Knobs measured and left off: `raw_genes_outside_expression`,
+   `satiation_fraction`, `attack_only_when_harmful`, `flee_can_escape`,
+   `full_sense_range`, `max_move_distance`, `food_targets_richest`,
+   `max_predation_efficiency`, `decay_sink_rate`;
+   `cell_light_absorption` at 0.2.
 
 **User's defaults** (their edit to `config.rs`): `random_uniform`, 1 000 cells,
 `max_maturity_ticks: 30`. Archetypes: `docs/handover/archetypes.json`.
@@ -84,7 +124,7 @@ Written 2026-09-19 for the next session. The goal is to keep finding and then fi
   - `src/render/` is no longer a local copy — the pull landed it as `775b923`. A leftover `stash@{0}` ("local render copies") is redundant and safe to drop.
   - This `docs/handover/` directory. `lab-harness.patch` in it is obsolete since step 15 (the lab is `src/bin/lab`) and can be deleted.
   - Step 15: `src/lib.rs`, `src/bin/lab/`, `src/sim/stats.rs` are new files; commit them together with `Cargo.toml` (`default-run`).
-- `cargo test` passes (261 library + 8 lab tests as of step 16). `cargo clippy --all-targets -- -D warnings` and `cargo fmt -- --check` pass — the `empty_line_after_doc_comments` lint is `allow`ed at both crate roots (`main.rs`, `lib.rs`) because it fires on the `@veridikt` convention CLAUDE.md mandates. `#![allow(dead_code)]` is gone from `sim/mod.rs`: with a library crate nothing public is dead.
+- `cargo test` passes (268 library + 10 lab tests as of step 20). `cargo clippy --all-targets -- -D warnings` and `cargo fmt -- --check` pass — the `empty_line_after_doc_comments` lint is `allow`ed at both crate roots (`main.rs`, `lib.rs`) because it fires on the `@veridikt` convention CLAUDE.md mandates. `#![allow(dead_code)]` is gone from `sim/mod.rs`: with a library crate nothing public is dead.
 - **What was lost:** the user's April 11–17 work was never pushed: branch 9 `feat/main-loop` (winit + pixels window, sim thread), debug color mode, fast-forward, decay/vent seeding, predator hunger gating and other balance tweaks, plus `docs/plan.md`. The original directory was deleted on 2026-06-10 and re-cloned from a stale mirror (`~/.gitnexus/repos/Primordium`, taken 2026-04-11 00:55).
 - **Where I looked for it:** reflog and dangling objects, the GitHub API (all PR refs, events, activity; `feat/main-loop` was never pushed), gists and repos, Claude transcripts, paste-cache and file-history (April purged by 30-day cleanup), micro backups, VS Code history, Trash, and a disk-wide grep. Only PR #10 was recoverable.
 - **What survives of April:** `april-prompts.md` in this directory is the user's prompt log from the lost sessions. It is a symptom log of what the running app showed.
@@ -118,7 +158,7 @@ errors. Without `--config` the lab runs `WorldConfig::default()` (the old lab ra
 |---|---|
 | (default) run | One JSON line per `--every` ticks: `class` (by diet), `gene_class`, `rows_90`, `effective_groups`, `per_class` (lifetime income/upkeep per tick of age, repro-ready share), `lineages`/`top_lin`/`xtab`, `phase`, `per_tick` (births, deaths, `death_causes`, kills, attacks), `actions_pct`, `energy_per_cell_tick` (incl. predation), `phase_pct`/`ms_per_tick`, `genetics`, `repro_gate` (incl. `blocked_dormant`), `vents`, `integrity`. `--traits`: per lineage, attack/armour as applied, hunger slot, maturity, cooldown, and `bite_margin`. |
 | `--score` | Per seed and arm: per group min/mean/CV/log-slope/persisted/established/extinct_at, `groups_persisting`, `first_loss`, `effective_groups`, `rows_90`, `non_default_phase`; a summary per arm and, with `--vs-set`/`--vs`, paired B−A differences with standard errors. `--series f.jsonl` writes the full time series. |
-| `--invade X` | Growth from rare of archetype X (or a 128-hex genome) introduced at `--at` into its own band: per-capita births/deaths while rare (until `--rare-cap`, default 5n), `reached_rare_cap`, extinct_at, invader causes of death and what the dead lived on, residents before/after (excluding invaders). |
+| `--invade X` | Growth from rare of archetype X (or a 128-hex genome) introduced at `--at` into its own band: per-capita births/deaths while rare (until `--rare-cap`, default 5n), `reached_rare_cap`, extinct_at, invader causes of death and what the dead lived on, residents before/after (excluding invaders). Since step 17 also `invader_repro_states` (share of invader-ticks held by each reproduction gate), `invader_mean_death_age`, `invader_dead_immature` and `invader_life_table` (adult birth rate, adult life, juvenile survival, `r0_estimate`). |
 | `--hash` | Per seed, a hash of the full world state (every live cell's fields and record, every tile field) every `--every` ticks (`--seeds 1-2 --ticks 600 --every 100`). Two runs printing the same lines ran bit-identically: the check that a knob at its default changes nothing (step 16). |
 | `--archetypes` `--niche` `--color-check` `--render` `--dump-config` | As before. |
 
@@ -170,6 +210,398 @@ All line numbers refer to the salvaged tree.
 | G1 | medium | CONFIRMED | Top-N gating runs over all 46 genes, so random parameter genes displace acquisition genes, which then decode ×0.1. The spawner's viability floor applies to **raw** bytes before antagonism and gating, so the "guaranteed" acquisition gene can still decode to ~0. | `genome.rs:252`, `spawner.rs` `random_genome` | Mean decoded photo at spawn 0.032; most founders classify as "none" (1359/2000, 2304–2747/4992) | Photo niche appears only after heavy selection |
 | B13 | medium | CONFIRMED-static | Y is toroidal too, so the vent row (bottom) is adjacent to the full-sun row (top). The Beer-Lambert scan still starts at y=0. The vertical niche gradient has a seam. | `world.rs:168-170` | — | Possibly "flocks migrate to bottom-right and die" |
 | B10 | low | CONFIRMED-static | `cell_ids()` is O(pool × free_list) because of `free_list.contains`, and `decode` runs ~5× per cell per tick. This will limit long runs once cells survive. | `world.rs:380-382` | — | Performance |
+
+### Step 20 — the user's four decisions: satiation, corpse baseline, packed colonies, 10k (2026-09-29)
+
+**1. Satiation (`satiation_fraction`, default 1.0 = off).** The user's choice for
+stabilising the predator: a cell with energy above this share of its storage cap
+starts no attack (it falls through to Flee/Move; being attacked, it still hits
+back inside the exchange). Test: `a_full_cell_does_not_hunt`. Knob off:
+bit-identical on 70 checkpoints.
+
+| arm (10 seeds, 2000 ticks) | groups persisting | hunters persisting | vs |
+|---|---|---|---|
+| archetypes 25%, `raw_genes` on, satiation 0.3 | 3.00 (+3.00 ± 0.00) | **0/10** | `raw_genes` on alone (0.00) |
+| archetypes 25%, `raw_genes` on, satiation 0.6 | 0.10 | 0/10 | same |
+| archetypes 5%, `raw_genes` on, satiation 0.3 | 2.80 (+2.60 ± 0.16) | **0/10** | `raw_genes` on alone (0.20) |
+| archetypes 25%, satiation 0.3 alone | 3.00 (−0.90 ± 0.10) | **0/10** (base 10/10) | base2 |
+| default world, satiation 0.3 | −0.10 ± 0.10 | 0/10 | base2 |
+| default world, `raw_genes` + satiation 0.3 | +0.10 ± 0.18 | 1/10 | `raw_genes` on |
+| predator invasion, `raw_genes` + satiation 0.3 | r +0.00185, R0 3.80 (was 3.21) | 6/6 grew | `raw_genes` on |
+
+**It does not stabilise the predator; it makes it a better hunter.** Seed 1,
+archetypes, `raw_genes` on: kills per tick 57 vs 33 at t=100 and predators 1 189
+vs 673. The archetype predator already had satiation in effect: above its hunger
+slot (25% of cap) its blow cannot get through prey armour, so a sated predator
+spent its tick on an attack that did nothing and stayed put. Satiation removes
+that wasted attack, the predator moves instead, spreads through the prey band and
+finds prey sooner when hungry again. The web "holds" at 3 groups only because the
+predators overshoot and go extinct. Left off. What limits a predator's *numbers*
+(interference between predators, or a prey refuge) is still untried.
+
+**2. Corpse decay = baseline + all remaining energy — defaults changed.** The
+deposit was already `corpse_biomass` (25) + `corpse_energy_fraction` (0.5) x the
+energy left. Swept with the fraction at 1.0 (single arms paired against base2;
+"scav@1400" is the sessile archetype scavenger introduced at t=1400, 6 seeds):
+
+| `corpse_biomass` | default: groups / eff. groups / scav mean | archetypes: groups / eff. groups / scav / photo | pred r diff | scav@1400 |
+|---|---|---|---|---|
+| 25 (fraction 1.0 only) | +0.00 / +0.03 ± 0.01 / −0 ± 48 | −0.10 / +0.06 ± 0.02 / +68 ± 6 / −157 ± 49 | +0.00029 ± 0.00022 | 6/6 grew, 1/6 extinct, 1–17 left |
+| **50** | −0.10 ± 0.10 / **+0.16 ± 0.05** / +448 ± 170 | −0.20 ± 0.20 / **+0.31 ± 0.02** / +388 ± 13 / −504 ± 53 | **+0.00047 ± 0.00014** | **6/6 grew, 0/6 extinct, 15–77 left** |
+| 75 | +0.10 / +0.11 ± 0.12 / **+8 498 ± 3 386** (rows_90 +46) | −0.20 / +0.58 / +2 125 ± 316 / −726 | +0.00097 ± 0.00019 | 6/6 grew, 0/6 extinct, 179–476 left |
+| 100 | +0.20 / −0.11 / **+25 355 ± 6 856** (rows_90 +149) | **−1.00 ± 0.15** (vent-feeders 0/10) / +0.11 / +11 208 / −934 | +0.00101 ± 0.00010 | 1 476–2 177 cells (took the world) |
+
+**Defaults are now `corpse_biomass = 50`, `corpse_energy_fraction = 1.0`**, in
+`config.rs` and in the benchmark `archetypes.json` (which pinned 25 / 0.5; the
+historical `default.json` and `step6-baseline.json` are left as they were).
+Measured reason: 50 is the first setting at which a sessile scavenger persists
+from rare after the old-age wave (0/6 extinct at t=2000), and it evens both worlds
+out; above it the baseline — energy that appears at every death, since a body is
+never paid for — feeds scavengers on each other's corpses: at 75 some default
+seeds run away, at 100 every seed does and the archetype world loses its
+vent-feeders. The new default tree is hash-identical to base2 run with those two
+`--set`s (28 checkpoints), so the 50 row is the new baseline (**base3**): default
+2.20 groups, archetypes 3.70, predator r −0.00101, scavenger (t=1000) −0.00284,
+6/6 extinct (the t=1000 assay still arrives before the corpse supply).
+
+**3. Packed colonies:** closed as intended by the user — edge cells move and the
+cells behind follow, so a dense colony moves slowly (section 5 item 4).
+
+**4. The 10k table** (the user allowed runs past 2000 ticks for it):
+
+5 seeds x 10 000 ticks (`--score --every 250`, window from t=5 000):
+
+| world, corpse setting | groups persisting | seeds extinct | runaway | notes |
+|---|---|---|---|---|
+| default, old 25 / 0.5 | 2.40 ± 0.55 | 0 | 0 | thermo kept on 2/5 |
+| default, 25 + full energy | 2.00 | 0 | 0 | |
+| default, **50 + full energy (new default)** | 2.00 | 0 | **1/5** | seed 2: 97 908 cells at t=10 000 |
+| default, 50 + full, `corpse_growth_ticks=100` | 2.40 ± 0.55 | 0 | 0 | |
+| archetypes, old 25 / 0.5 | 2.20 ± 1.79 | 1/5 (t=4 000) | 0 | all four kept on seeds 2, 5 |
+| archetypes, **50 + full (new default)** | 2.20 ± 1.30 | 0 | 0 | all four kept on seed 5 |
+| archetypes, 50 + full, growth 100 | 0.80 ± 1.30 | 3/5 | 0 | 5 seeds; noisy |
+
+Against step 6 (1 of 5 seeds with three classes, predators never): no default
+seed dies in 10 000 ticks and every one keeps producers and scavengers, but
+hunters persist on none, and the archetype web keeps all four groups on only 1–2
+seeds of 5 whatever the corpse setting.
+
+**The 50 baseline has a pump that 2 000-tick runs cannot see.** Default seed 2:
+scavengers 7 249 → 14 759 → 37 030 → 95 473 between t=7 000 and t=10 000, births ≈
+deaths ≈ 2 100 per tick, 92% of deaths starvation. A young scavenger that starves
+still leaves 50 of body; its neighbours scavenge 45 of it and breed children that
+starve in turn. A body is never paid for, so a short life nets energy, and
+evolution finds the loop. Full energy alone (25 + full) does not run away.
+
+**`corpse_growth_ticks` (new, default 0 = off)**: a body grows with age,
+`corpse_biomass * min(1, age / corpse_growth_ticks)`, so a newborn leaves little
+and an old cell the whole baseline (`energy::corpse_body`). Test:
+`a_young_corpse_leaves_less_body_than_an_old_one`; knob off bit-identical (42
+checkpoints). At 100 it closes the pump (no default seed runs away by t=10 000)
+and the t=1400 scavenger still persists (6/6 grew, 0/6 extinct, 8–24 left), but it
+gives back most of the scavenger gain at 2 000 ticks (default scav −787 ± 225 vs
+the 50 row; archetype effective groups −0.15 ± 0.03) and the 10k archetype arm
+lost 3 of 5 seeds (the old values lost 1; five seeds cannot separate these).
+**Made the default at the user's choice** (`corpse_growth_ticks = 100`, in
+`config.rs` and `archetypes.json`). Three tests built age-0 corpses and now give
+their cells a grown age (200). The new default tree is hash-identical to the
+growth-100 arm (28 checkpoints), so that arm is the new baseline (**base4**):
+default 2.30 groups, archetypes 3.50 (hunters 8/10), predator r −0.00086,
+scavenger at t=1000 −0.00285 (6/6 extinct), at t=1400 6/6 grew and 0/6 extinct.
+
+
+### Step 19 — the rest of the list: four knobs, one fix, and what none of them does (2026-09-29)
+
+Every item left after step 18, under the step-16 protocol. New knobs default to
+the old behaviour; `lab --hash` (70 checkpoints: default, `archetypes.json`,
+`random_clusters`, `flee_can_escape`, `raw_genes_outside_expression`; 2 seeds
+x 600 ticks) was **bit-identical to the step-18 tree after every change**, and
+every knob diverges when on. Each change has a test that fails on the old code.
+Measurements are single arms paired per seed against base2 (both scorecards,
+10 seeds; both invasions at t=1000, 6 seeds), plus the extra runs named below.
+266 + 10 tests, clippy and fmt pass.
+
+**Changes**
+- `attack_only_when_harmful` now counts venom (fix inside a default-off knob):
+  an attack passes if the blow beats the target's armour **or** the venom gets
+  through its membrane (`SenseResult::nearest_threat_membrane`, and a
+  `venom_hurts` helper shared with `nearest_danger`). Test:
+  `a_venomous_cell_attacks_what_its_blow_cannot_hurt`.
+- `full_sense_range` (false): `mapped_sense_radius` was `ceil(gene * 3)` clamped
+  to 1–4, so no cell ever saw past 3 tiles (spec gene 23 says 1–4). On, it is
+  `ceil(gene * 4)`; territory, offspring scatter and move distance follow.
+  `config` is threaded into the three mappers and `compute_move_target`. Test:
+  `a_maxed_sense_radius_reaches_the_spec_s_four_tiles`.
+- `cell_light_absorption` (0.2): the per-cell α hard-coded in
+  `world::tile_absorption`. Test:
+  `a_cell_shades_the_tiles_below_it_by_the_configured_absorption`.
+- `decay_sink_rate` (0.0): `diffusion::sink_decay` moves that share of each
+  tile's decay one row toward the vents per tick, bottom-up (nothing moves two
+  rows in a tick), blending fade rates, settling on the bottom row instead of
+  wrapping. Test: `decay_sinks_one_row_a_tick_and_settles_on_the_floor`.
+
+**Scorecards and invasions** (paired diff vs base2 ± SE; hunter/thermo counts are
+seeds persisting, base in brackets):
+
+| arm | default: groups | default: other | archetypes: groups | archetypes: other | pred r diff | scav r diff |
+|---|---|---|---|---|---|---|
+| `full_sense_range` | −0.10 ± 0.10 | thermo 2/10 (3) | −0.10 ± 0.10 | hunter 9/10 (10) | +0.00012 ± 0.00031 | 0 (identical) |
+| `attack_only_when_harmful` (venom-aware) | −0.30 ± 0.15 | thermo 0/10 (3), rows −5.9 ± 2.1 | +0.00 ± 0.15 | eff. groups +0.08 ± 0.03, scav +100 ± 19 | +0.00023 ± 0.00021 | 0 |
+| `max_move_distance=2` | +0.10 ± 0.10 | scav −191 ± 119, photo +130 ± 54 | +0.00 ± 0.00 | — | 0 (identical: 0.663 x 2 rounds to 1) | 0 |
+| `max_move_distance=3` | +0.00 ± 0.15 | — | −0.20 ± 0.20 | hunter 9/10 | +0.00030 ± 0.00018 | 0 |
+| `food_targets_richest` | +0.10 ± 0.18 | hunter 2/10 (0) | −0.10 ± 0.18 | — | +0.00033 ± 0.00024 | 0 |
+| `cell_light_absorption=0.1` | −0.20 ± 0.13 | eff. −0.16 ± 0.05, photo +1 895 ± 164, rows +2.4 | **−0.50 ± 0.17** | eff. −0.18 ± 0.01, hunter 5/10, rows +3.7 | +0.00002 ± 0.00024 | +0.00027 ± 0.00003 |
+| `cell_light_absorption=0.05` | +0.10 ± 0.18 | eff. −0.17 ± 0.04, photo +4 630 ± 190, rows +7.2 | **−0.80 ± 0.25** | eff. −0.29 ± 0.02, hunter 2/10, rows +8.9 | not measurable (0 placed) | not measurable |
+| `decay_sink_rate=0.05` | +0.20 ± 0.20 | scav −181 ± 108, thermo 5/10 | −0.20 ± 0.13 | hunter 7/10, photo +566 ± 53 | +0.00035 ± 0.00021 | +0.00014 ± 0.00005 |
+| `decay_sink_rate=0.2` | +0.00 ± 0.15 | scav −290 ± 176 | +0.00 ± 0.00 | scav −47 ± 19, photo +491 ± 181 | −0.00105 ± 0.00036 | +0.00014 ± 0.00003 |
+
+- **None of the nine arms improves persistence beyond noise, and none flips an
+  invasion.** No default change is proposed.
+- Thinner shading (`cell_light_absorption`) deepens life as intended (rows_90
+  +2.4 to +8.9) but lets producers take over (+58% to +143%), so the world gets
+  *less* even and archetype hunters lose seeds. At 0.05 producers fill the
+  predator's row and the invasion assay cannot place invaders.
+- `max_move_distance=2` is a no-op for the archetype predator and scavenger
+  (their speeds round to one tile).
+
+**Item 0: the archetype world under `raw_genes_outside_expression`, predators
+starting rare** (paired scorecards, knob off vs on at the same shares, 10 seeds):
+
+| predator share | knob off: groups persisting | knob on | knob on: first loss |
+|---|---|---|---|
+| 25% (step 18) | 3.90 | 0.00 | t≈650 |
+| 10% `[0.35,0.25,0.3,0.1]` | 4.00 | 0.00 | t=750–850 |
+| 5% `[0.4,0.25,0.3,0.05]` | 3.80 | 0.20 | t=1 000–1 100 |
+| 1% `[0.45,0.25,0.29,0.01]` | 3.30 (hunter 5/10) | 2.90 (hunter 9/10) | t=1 450–2 000 on 4 seeds |
+
+A self-replacing predator crashes the web from every starting share; starting
+rarer only delays it. At 1% it keeps hunters on 9/10 seeds (knob off 5/10), but
+photo −2 016 ± 54 and scavengers and vent-feeders are lost on half the seeds. The
+predator grows until it has eaten its prey out: **nothing in the sim stabilises a
+predator that can replace itself** (satiation, interference between predators, or
+a prey refuge would; none exists). The knob stays off. On the benchmark: with the
+knob off, 10% predators persist on 10/10 seeds (4.00 groups) against 25%'s 3.90,
+but that web too survives only through the synchronized old-age die-off.
+
+**Item 2: scavengers, sinking decay and brakes** (`--invade`, 6 seeds, 600-tick
+window from t=1400; "band" = the archetype band rows 0–16, "below" = rows 16–32
+under the producers; at t=1000 every arm is extinct on 6/6):
+
+| invader, placement | sink 0 | sink 0.05 | sink 0.2 |
+|---|---|---|---|
+| archetype scavenger, band | 5/6 grew, peak 158, 4/6 extinct | 6/6 grew, **peak 650–985**, 5/6 extinct | 2/6 grew, peak 151, 4/6 extinct |
+| archetype scavenger, below | 0/6 grew, 6/6 extinct | 3/6 grew, 5/6 extinct | 6/6 grew, **peak 672–746**, 6/6 extinct |
+| braked (maturity 150, cooldown 50, same upkeep), band | 0/6, peak 34–49, 6/6 extinct | | |
+| braked, below | | | 0/6, peak 81–87, 6/6 extinct |
+| braked (maturity 300, cooldown 100, +0.26 upkeep), band / below | 0/6, peak 30, 6/6 | | 0/6, peak 38–45, 6/6 |
+
+Sinking decay makes the booms bigger where it lands and takes food from the
+sunlit band (default scavengers −181 / −290 in the scorecards); reproduction
+brakes remove the boom and the lineage still dies. **The sessile scavenger niche
+is supply-limited, not only an overshoot**: after the producers' old-age wave
+there is not enough steady death to feed it, wherever the decay falls.
+
+**Lab modes re-run** (item 7 of section 5): `--niche` (photo capacity 248 827
+cells, vents 1 973, upkeep 0.243 for a lean specialist), `--color-check` (one-byte
+hue shift 14.8° vs 69.5° unrelated, 99.95% of siblings in the same band: B8 holds),
+`--archetypes` (under `raw_genes_outside_expression` producer upkeep drops
+0.865 → 0.687, and producers and scavenger gain maturity 28 / cooldown 7),
+`--render` (archetypes, seed 1, t=0/500/1000: works; the photic band and the vent
+colonies are the only life). The step-6 10k table is not re-run (≤2000-tick rule).
+Section 5 is rewritten: every old item is closed or superseded except packed
+colonies (a design decision).
+
+### Step 18 — raw-read genes out of expression (option A), behind a knob (2026-09-29)
+
+**Change.** `genome::RAW_READ_GENES` lists the seven genes the sim only reads
+from the raw bytes: `mutation_rate`, `mutation_magnitude`, `gene_linkage`,
+`transposon_rate`, `horizontal_transfer` (read by `mutate`), and
+`aggression_trigger`, `kin_recognition_precision` (read raw by `sense`, B12).
+Step 17 counted five; the transposon and horizontal-transfer bytes are read raw
+too. Nothing but one test reads any of their decoded values. With the new knob
+`raw_genes_outside_expression` (default **false**), `apply_top_n_gating` leaves
+them out of the ranking (they keep their normalized value and take no slot) and
+`metabolic_cost` does not sum them. `spec.md` (Top-N Gating, parameter table) and
+`architecture.md` updated; the stale pipeline order in `decode`'s doc comment
+fixed. Test: `raw_read_genes_neither_take_a_slot_nor_cost_upkeep` (fails with
+either half of the new path disabled). Knob off: `lab --hash` bit-identical to
+the pre-change tree on 56 checkpoints (default, `archetypes.json`,
+`random_clusters`, the step-14 switches; 2 seeds x 600 ticks). Knob on:
+deterministic on repeat; the default world diverges from t=0, because the
+spawner's viability floor reads decoded genes, so **random-seeded founders
+differ between arms** (archetype founders are fixed genomes).
+
+What it does to the archetypes' decoded genomes: the predator gets lifespan
+1 316, maturity 300 and offspring share 0.43 (was 401 / 200 / 0.05); producers
+and the scavenger get maturity 28 and cooldown 7 (was 2 / 0); everyone's upkeep
+drops by the mutation genes' ~0.14/tick.
+
+**Measured** (knob on vs base2; scorecards paired over 10 seeds, invasions over 6):
+
+| measure | knob off (base2) | knob on | paired diff |
+|---|---|---|---|
+| default: groups persisting | 2.30 | 2.20 | −0.10 ± 0.23 |
+| default: hunter persists / thermo persists | 0/10 / 3/10 | 1/10 / 1/10 | hunter mean +11 ± 6, thermo −11 ± 8 |
+| default: photo mean / scav mean | | | +259 ± 123 / +20 ± 68 |
+| **archetypes: groups persisting** | **3.90** | **0.00** (all extinct by t=650–750, 10/10) | **−3.90 ± 0.10** |
+| **predator invasion r** | −0.00148, 0/6 grew, R0 0.57 | **+0.00158, 6/6 grew, R0 3.21** | +0.00306 ± 0.00013 |
+| scavenger invasion (t=1000) r | −0.00293, 6/6 extinct, peak 121 | −0.00246, 6/6 extinct, peak 102 | +0.00047 ± 0.00002 |
+| sessile scavenger at t=1400 | 5/6 grew, peak 158, 4/6 extinct | 0/6 grew, peak 109, 2/6 extinct (0–2 left) | |
+| mobile scavenger at t=1400 | peak 678, 0/6 extinct, 1–4 left | peak 594, 0/6 extinct, **5–24 left** | |
+
+- **The predator now replaces itself from rare in the real implementation**
+  (residents under the knob too): R0 3.21, and the residents it invades survive to
+  t=2000 (photo 3 144–3 359 vs 3 643 without it).
+- **The archetype web collapses, and the cause is the predator outliving its
+  founders' old age.** Seed 1, to t=700, every 50 ticks: without the knob the
+  founder predators all die of old age at t≈401–450 (hunters 526 → 92, old-age
+  deaths 8.7/tick) and kills fall from ~30 to ~5 per tick, which lets producers
+  recover (1 229 → 2 453 by t=700). With the knob, predators hold at 520–620 and
+  kill ~30 per tick straight through; producers fall 1 292 → 935 → 590 → 255 → 55
+  → 0 between t=400 and t=650, and the predators starve by t=700. Producer births
+  are the same in both arms up to t=400 (~27–32 per tick), so the producers' new
+  maturity/cooldown brakes are not the cause. **The archetype world's four-way
+  persistence (3.9 groups) depended on the whole founder predator cohort dying of
+  old age at once**, 1 250 predators seeded as 25% of the world.
+- Default world: no measurable change in persistence; slightly more producers
+  and hunters (1 seed of 10 keeps hunters). Founders differ between arms here,
+  so pairing removes less of the seed noise.
+- Scavengers: the new brakes shrink the boom (peaks 102–109 vs 121–158) and the
+  mobile variant leaves more survivors at t=1400 (5–24 vs 1–4), but no scavenger
+  arm persists in numbers.
+
+**Not flipped.** It gives the predator a niche from rare and leaves the default
+world alone, but it destroys the archetype benchmark. Before flipping: re-test
+the archetype world with the knob and a predator share that starts rare (the
+invasion shows a rare long-lived predator coexisting to t=2000), and decide
+whether the benchmark should seed 25% predators at all.
+
+### Step 17 — two defaults flipped; the predator's brake is its lifespan (2026-09-27)
+
+**Defaults flipped:** `corpses_keep_energy` and `foragers_stay_on_food` are now
+`true` (the user's call on step 16's proposal). The new default tree is
+hash-identical to the step-16 tree run with both knobs on (`lab --hash`,
+`WorldConfig::default()` and `archetypes.json` x 2 seeds x 600 ticks, 28
+checkpoints), so step 16's "keep + stay" row *is* the flip's paired effect:
+default scavengers +312 ± 158, archetype scavengers +77 ± 13, archetype producers
+−275 ± 113, persistence unchanged. `a_forager_stays_on_a_meal_and_leaves_an_empty_tile`
+now sets its "without the switch" arm explicitly. `spec.md` marks both as on by
+default. The four commands re-run on this tree (`base2`, the baseline for
+everything below): default groups persisting 2.30 ± 0.48 (hunter 0/10), archetypes
+3.90 ± 0.32, predator invasion r −0.00148 ± 0.00017 (0/6 grew, 1/6 extinct),
+scavenger invasion −0.00293 ± 0.00003 (6/6 extinct).
+
+**New lab output (`--invade`, observation only).** Per seed and pooled:
+`invader_repro_states` — the share of rare-phase invader-ticks spent dormant,
+immature, in cooldown with the energy to breed (`cooldown_only`), in cooldown and
+short of energy, past cooldown and short of energy (`energy_only`), or `eligible`,
+judged in `decide`'s order on phase-modified genes; `invader_mean_death_age`,
+`invader_dead_immature`; and `invader_life_table`: adult birth rate (births per
+mature invader-tick), adult life (the introduced genome's lifespan minus maturity,
+cut short at the measured non-old-age adult death rate), juvenile survival
+(matured / (matured + died young)) and their product `r0_estimate`, births per
+newborn per lifetime. **r while rare is a window average**: a lineage whose
+lifespan outlasts the window never pays its old-age deaths inside it, so R0 is
+the number to read when life history changes. R0 is meaningless for a boom
+(a lineage past the rare cap in a few ticks). The instrumented invasion
+reproduces every seed's r exactly. Tests:
+`an_invader_is_counted_under_the_gate_that_holds_it`,
+`r0_is_births_per_adult_tick_times_adult_life_times_juvenile_survival`.
+
+**Where the predator's time goes** (archetype predator, base2 invasion, 6 seeds):
+52% of invader-ticks immature; of mature time, 98% below the reproduction
+threshold (`energy_only` 33% and `cooldown_and_energy` 15% of all invader-ticks),
+1.5% held by the cooldown alone, 0.6% eligible. Adult birth rate 0.0041 (one birth per ~240
+mature ticks), adult life 200 of a possible 201, juvenile survival 0.69:
+**R0 = 0.57**. Energy sets the birth rate; the cooldown (100) is shorter than the
+energy interval (~240), so it almost never binds. 32% of dead invaders die
+before maturity (starvation: a newborn gets the 0.05 floor share, see below).
+
+**Why the life history is what it is — top-N gating.** The predator expresses
+12 genes ≥ 110: predation, maturity, cooldown, sense (255), chemotaxis (220),
+speed (170), reproduction threshold (150), storage cap (140), mutation rate,
+mutation magnitude, temperature preference (128), attack (110). `max_age` (96)
+and `offspring_energy_share` (110, loses the tie to attack on index) are gated:
+lifespan 401 (vs 1 316 for the producers, whose `max_age` 96 is expressed),
+maturity 300 capped to half of that (200), share 0.043 → the 0.05 floor. **Two of
+the 12 slots go to `mutation_rate` and `mutation_magnitude`, whose decoded values
+nothing reads** (`Genome::mutate` reads the raw bytes); they only cost upkeep
+(0.07/tick each). `aggression_trigger`, `kin_recognition_precision` and
+`gene_linkage` are also read raw.
+
+**The test.** Edited copies of the archetype predator via `--invade <hex> --rows
+16,1` (the base hex through this path reproduces `--invade pred` exactly). Every
+edit is built so the expressed set stays the same, or swaps one gene in for
+`mutation_magnitude` (109: gated; its raw magnitude drops 15%). Maturity and
+cooldown at 255 each cost 0.2 upkeep/tick, so shortening either also cuts upkeep;
+each such arm has a "paid" twin that restores it (raising the decoded-only
+mutation genes), and an upkeep-only arm cuts 0.12 with no life-history change.
+Decoded values checked through `Genome::decode` for every arm. Paired over seeds
+1–6 against base2; lifespan / maturity / cooldown / share, upkeep per tick:
+
+| arm | life / mat / cool / share | upkeep | r (paired diff) | grew | adult births/tick | adult life | juv. surv. | **R0** |
+|---|---|---|---|---|---|---|---|---|
+| base | 401 / 200 / 100 / 0.05 | 1.570 | −0.00148 | 0/6 | 0.0041 | 200 | 0.69 | **0.57** |
+| upkeep only (maturity 170, mutation genes 111) | same | 1.452 | −0.00108 (+0.00039 ± 0.00021) | 0/6 | 0.0044 | 200 | 0.73 | 0.64 |
+| cooldown 50 | 401 / 200 / 50 / 0.05 | 1.441 | −0.00095 (+0.00052 ± 0.00025) | 0/6 | 0.0049 | 200 | 0.70 | 0.68 |
+| cooldown 50, paid | same | 1.570 | −0.00087 (+0.00060 ± 0.00017) | 0/6 | 0.0055 | 198 | 0.66 | 0.72 |
+| maturity 130 | 401 / 130 / 100 / 0.05 | 1.428 | −0.00011 (+0.00136 ± 0.00026) | 3/6 | 0.0045 | 256 | 0.75 | 0.88 |
+| maturity 130, paid | same | 1.567 | −0.00011 (+0.00137 ± 0.00034) | 3/6 | 0.0051 | 245 | 0.74 | 0.92 |
+| maturity 100 via `max_maturity_ticks=100` | 401 / 100 / 100 / 0.05 | 1.570 | −0.00154 (−0.00007 ± 0.00021) | 0/6 | 0.0035 | 249 | 0.65 | 0.56 |
+| **lifespan 1 475** (`max_age` 111 expressed, maturity 170) | 1475 / 200 / 100 / 0.05 | 1.466 | **+0.00139 (+0.00287 ± 0.00020)** | **6/6** | 0.0043 | 1 193 | 0.53 | **2.75** |
+| **lifespan 1 475, paid** | same | 1.557 | **+0.00127 (+0.00275 ± 0.00020)** | **6/6** | 0.0042 | 1 115 | 0.55 | **2.59** |
+| share 0.43 (`offspring_energy_share` expressed) | 401 / 200 / 100 / 0.43 | 1.556 | −0.00001 (+0.00147 ± 0.00028) | 2/6 | 0.0046 | 199 | **0.95** | 0.87 |
+| all four | 1475 / 130 / 50 / 0.43 | 1.271 | +0.00272 (+0.00420 ± 0.00018) | 6/6 | 0.0055 | 968 | 0.88 | 4.63 |
+
+- **Only the lifespan flips the sign on its own**, on 6/6 seeds, and it survives
+  paying the upkeep back (R0 2.59). 87–95% of its dead die before maturity,
+  86–87% of starvation, almost none of old age; it peaks at 92–107 cells vs 39.
+- The adult birth rate barely moves in any arm (0.0035–0.0055): energy fixes the
+  rate, and the life cycle decides how many of those intervals a predator lives
+  through. The brake that binds is the 201-tick adult span that gating `max_age`
+  leaves it, not the maturity or cooldown genes step 12 installed.
+- Maturity 130 and share 0.43 each bring R0 to ~0.9; the share does it by
+  removing juvenile starvation (juvenile survival 0.69 → 0.95, starvation 28% →
+  7% of deaths). The cooldown is worth little (R0 0.72 paid). Upkeep alone: 0.64.
+- The config maturity arm is **confounded, not a null**: `max_maturity_ticks=100`
+  also moves the residents' gated maturity from 2 ticks to 0, and invader toxin
+  deaths go 5% → 26%. Use genome edits for single-lineage life-history tests.
+- Not tested: whether a long-lived predator *coexists* (step 12 found efficient
+  predators eat the web out). R0 2.6 assumes the adult birth rate holds across a
+  1 275-tick adult life; it was measured over the first ~800.
+
+**Late scavenger invasion** (`--at 1400`, after the producers' old-age wave at
+t≈1316; 600 ticks; the sessile archetype and step 16's mobile variant; "keep" =
+`corpses_keep_energy`, "stay" = `foragers_stay_on_food`; extinct counts at t=2000):
+
+| invader, arm | at 1000: peak / extinct / survivors | at 1400: grew / peak / extinct / survivors |
+|---|---|---|
+| sessile, keep + stay (default) | 121 / 6/6 / — | **5/6** / 158 / 4/6 / 9, 1 |
+| sessile, no keep | 121 / 6/6 / — (bit-identical) | 0/6 / 128 / 5/6 / 1 |
+| mobile, keep + stay (default) | 247 / 3/6 / 24, 20, 20 | 6/6 / **678** / **0/6** / 1–4 each |
+| mobile, no keep | 247 / 6/6 / — | 6/6 / 233 / 4/6 / 3, 1 |
+| mobile, no stay | 247 / 5/6 / 23 | 6/6 / 652 / 3/6 / 8, 2, 1 |
+| mobile, neither | 247 / 6/6 / — | 6/6 / 235 / 4/6 / — |
+
+- The late window is the first assay in which kept corpse energy shows: the
+  sessile invader passes the rare cap on 5/6 (0/6 without), the mobile one's boom
+  triples (678 vs 233). **Neither persists**: every arm booms on the wave's decay
+  and busts to 0–9 cells by t=2000. The scavenger's r while rare reads its boom,
+  not a niche; its problem is overshoot on a pulse (maturity 2, cooldown 0: the
+  opposite brake problem from the predator's).
+
+**Proposals (not made):**
+- Take the decoded-only genes (`mutation_rate`, `mutation_magnitude`, and the
+  raw-read `aggression_trigger`, `kin_recognition_precision`, `gene_linkage`) out
+  of top-N ranking and metabolic cost, behind a knob. For the archetype predator
+  that frees the two slots `offspring_energy_share` and `max_age` need (≈ the
+  "all four" arm without the cooldown/maturity edits); it changes every genome in
+  every world, so it needs the full scorecard.
+- Or, narrower: give the archetype predator an expressed `max_age` in
+  `spawner::archetype_genome`, then score the four-way web (`archetypes.json`,
+  10 seeds) to see whether a self-replacing predator coexists or eats the web out.
+- Scavenger: test the reproduction brakes (cooldown, maturity expressed) against
+  the boom-bust in the t=1400 assay.
 
 ### Step 16 — four mechanism changes, judged by the invasion rates (2026-09-27)
 
@@ -1552,42 +1984,24 @@ in the cost sum), but it becomes real if metabolism is ever restructured as
 
 ## 5. Open hypotheses for the next session
 
-Everything this section used to list is closed. What follows is what is actually
-left, in the order I would take it.
+Rewritten after step 19; the live list is "Remains" in "Start here". What the
+old items became:
 
-1. **Scavengers in the archetype bands still cannot bootstrap.** Under *random*
-   seeding this is largely resolved by step 10 — scavengers now persist to 10k
-   (766 on uniform seed 2, 1992 on clusters seed 3). The hand-built band still
-   goes 500 → 936 → 0 by t=200 (measured before step 10): an overshoot on the
-   seeded windfall. Revisit after the archetypes are re-tuned (item 3).
-
-2. **No seeded four-way food web is sustainable yet.** The only configuration that
-   keeps hunters alive to t=2000 does it by the predator lineage splitting into
-   producers and hunters; the seeded producers are dead by then. Full sweep table
-   in step 8.
-
-3. ~~**Mobility is structurally unreachable for a random genome**~~ — **fixed in
-   step 10** by moving top-N gating ahead of the antagonistic pairs. Three or more
-   classes now coexist on 2 of 3 seeds at 10k under uniform seeding, with hunters
-   carrying positive net. `random_clusters` re-measured at 10k: two seeds improve
-   13x and 55x with mobile classes, **seed 2 collapses to 22**. **The archetype bands
-   broke** (equal shares extinct, pyramid ends all `PRED->photo`): their genomes were
-   tuned against the old decode order and need re-tuning. `--niche` and
-   `--archetypes` not yet re-run.
-
-4. **A packed region cannot move at all** — `compute_move_target` needs an empty
-   adjacent tile. Measured: Move 0.0% → 6.0% purely from making the archetype bands
-   sparser. Worth deciding whether dense colonies *should* be immobile.
-
-5. **`adaptation_rate` (gene 38)** is the one gene the simulation does not read. Now
-   listed under Planned Future Extensions in `spec.md` rather than left as a phantom.
-
-6. ~~**Diffusion still costs the same with 18 cells alive as with 5000.**~~ **Done in
-   step 11**: 25.2 → 5.7 ms/tick on `default.json`, and the cost now scales with the
-   population. Also found and fixed the temperature map being erased by tick 300.
-
-7. **Not yet re-measured after step 8:** the `--niche`, `--color-check` and `--render`
-   modes, and the 5-seed 10k table in step 6. The economy moved under all of them.
+1. ~~Scavengers in the archetype bands cannot bootstrap~~ — superseded: the band
+   persists (steps 12, 15), but a scavenger introduced from rare booms and busts
+   on the old-age wave (steps 16–18). Still open, see "Remains".
+2. ~~No seeded four-way food web is sustainable~~ — superseded by step 12
+   (`archetypes.json` holds four groups), and qualified by steps 18–19: it holds
+   because the founder predator cohort dies of old age at t≈401.
+3. ~~Mobility unreachable for a random genome~~ — fixed in step 10.
+4. ~~**A packed region cannot move at all**~~ — closed as intended (user,
+   2026-09-29): cells on a colony's edge move and the ones behind follow into
+   the freed tiles, so a dense colony moves slowly rather than not at all.
+5. ~~`adaptation_rate` is not read~~ — implemented in step 14.
+6. ~~Diffusion cost does not scale with population~~ — done in step 11.
+7. ~~`--niche`, `--color-check`, `--render` not re-measured~~ — re-run in step 19.
+   The 5-seed **10k** table in step 6 is not re-run: it breaks the
+   ≤2000-tick rule, so it waits for the user's go-ahead.
 
 ## 6. Suggested fix order
 

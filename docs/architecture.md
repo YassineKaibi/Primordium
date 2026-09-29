@@ -212,7 +212,7 @@ For each living cell in the next grid:
 - Add photosynthesis income (based on local sunlight and effective `photosynthesis_rate`)
 - Add thermosynthesis income (based on vent proximity and effective `thermosynthesis_rate`)
 - Add scavenge income (based on tile decay matter and effective `scavenge_ability`)
-- Subtract metabolic cost (summed per-gene expression cost x `metabolic_cost_scale`, plus the temperature-mismatch penalty)
+- Subtract metabolic cost (summed per-gene expression cost x `metabolic_cost_scale`, plus the temperature-mismatch penalty; with `raw_genes_outside_expression` the raw-read genes are not summed)
 - Apply venom tick damage if poisoned
 - Apply toxin damage if on toxic tile (reduced by `toxin_resistance` and `membrane`)
 - If age >= the cell's lifespan (from `max_age`): mark dead of old age; with `corpses_keep_energy`, lay `corpse_energy_fraction` of the energy it held on its tile
@@ -221,7 +221,7 @@ For each living cell in the next grid:
 
 ### Phase 6: Cleanup
 
-- Dead cells become decay matter on their tile (`corpse_biomass` + `corpse_energy_fraction` of any energy left)
+- Dead cells become decay matter on their tile (`corpse_biomass`, grown with age when `corpse_growth_ticks` > 0, + `corpse_energy_fraction` of any energy left)
 - Generate toxin if deaths exceed `toxin_generation_threshold` in a local area
 - Return dead cell indices to the free list
 - Write pheromone contributions from living cells with `signal_emission`
@@ -238,7 +238,7 @@ Hardcoded priority order, evaluated top to bottom. First action whose gate condi
 | Priority | Action    | Gate condition                                                                 |
 |----------|-----------|--------------------------------------------------------------------------------|
 | 1        | Reproduce | energy > max(reproduction_threshold, `reproduction_energy_floor`) AND cooldown expired AND empty adjacent tile exists AND age >= maturity_age |
-| 2        | Attack    | hostile target within attack_range (genetic distance > aggression_trigger)     |
+| 2        | Attack    | hostile target within attack_range (genetic distance > aggression_trigger). With `attack_only_when_harmful`: AND the blow beats the target's armour or the venom gets through its membrane. With `satiation_fraction` < 1: AND energy <= satiation_fraction x storage cap |
 | 3        | Flee      | threat detected AND flee_response > 0 AND escape tile available. With `flee_can_escape`: a threat whose blow beats this cell's armour or whose venom gets through its membrane, AND random < speed * flee_response, AND escape tile available |
 | 4        | Move      | speed check passes (random < speed/255, scaled by 1 - adhesion x kin share; with `foragers_stay_on_food` also by 1 - chemotaxis x own-tile food share) AND destination tile available |
 | 5        | Share     | kin adjacent AND resource_sharing check passes AND own energy above threshold  |
@@ -272,6 +272,7 @@ WorldConfig {
 
     // Decay
     decay_rate: f32
+    decay_sink_rate: f32            // share of a tile's decay that sinks one row per tick
     initial_decay_matter: f32       // detritus on every tile at world creation
     corpse_decay_scale_min: f32
     corpse_decay_scale_max: f32
@@ -286,10 +287,13 @@ WorldConfig {
     max_transposon_rate: f32
     max_adaptation_rate: f32        // thermal acclimation per tick at adaptation_rate 255
     max_move_distance: u32          // tiles per move; 1 = the spec's one tile per tick
-    attack_only_when_harmful: bool
+    attack_only_when_harmful: bool  // attack only if the blow beats armour or the venom gets through the membrane
+    satiation_fraction: f32         // above this share of its cap a cell starts no attack; 1.0 = off
     flee_can_escape: bool           // flee rolls speed, only from real threats; moves resolve before blows
     food_targets_richest: bool
     foragers_stay_on_food: bool     // a cell on food moves less, by chemotaxis x own-tile food share
+    full_sense_range: bool          // sense_radius spans 1-4 tiles (ceil(gene*4)) instead of 1-3
+    cell_light_absorption: f32      // Beer-Lambert alpha an occupied tile adds to its column (0.2)
     max_horizontal_transfer: f32      // largest byte shift at gene = 255
 
     // Lifecycle
@@ -303,6 +307,7 @@ WorldConfig {
     // Corpses
     corpse_biomass: f32             // structural matter every corpse leaves
     corpse_energy_fraction: f32     // share of remaining energy that becomes decay
+    corpse_growth_ticks: u32        // ticks a body takes to reach full biomass; 0 = always full
     corpses_keep_energy: bool       // old corpses keep their energy; a kill's uneaten part becomes decay
 
     // Predation
@@ -313,6 +318,7 @@ WorldConfig {
     top_n_falloff: f32
     metabolic_cost_exponent: f32
     metabolic_cost_scale: f32       // multiplier on summed expression cost
+    raw_genes_outside_expression: bool // raw-read genes take no top-N slot, cost no upkeep
 
     // Energy economy
     photo_max_income: f32           // income of a perfect photosynthesizer in full sun
