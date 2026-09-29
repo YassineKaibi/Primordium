@@ -43,6 +43,30 @@ pub fn lifespan_ticks(decoded: &DecodedGenes, config: &WorldConfig) -> u32 {
     config.min_lifespan_ticks + (decoded.get(genome::MAX_AGE) * span) as u32
 }
 
+// ── Corpse body ────────────────────────────────────────────────────
+
+/// Structural matter a corpse leaves, whatever energy it still held:
+/// `corpse_biomass`, or with `corpse_growth_ticks` that share of it the body
+/// had grown to, `age / corpse_growth_ticks`, capped at the full biomass.
+///
+/// A body is never paid for, so its biomass is energy made at death. At 50 a
+/// cell that starved young left more than the energy it cost to make, and
+/// scavengers bred children that starved to feed the next brood: on one seed
+/// the population went 7 249 → 95 473 between t=7 000 and t=10 000 (handover
+/// step 20). A body that grows with age leaves a newborn little and an old
+/// cell the whole baseline.
+
+// @veridikt
+// purpose: "Biomass a corpse leaves on top of its remaining energy, grown with the cell's age when corpse_growth_ticks is set"
+// because: "Biomass is energy that appears at death; a full body for a newborn made short lives a net energy source that evolution found (a starvation pump), while a body that grows with age keeps the full baseline for old corpses"
+pub fn corpse_body(age: u32, config: &WorldConfig) -> f32 {
+    if config.corpse_growth_ticks == 0 {
+        return config.corpse_biomass;
+    }
+    let grown = (age as f32 / config.corpse_growth_ticks as f32).min(1.0);
+    config.corpse_biomass * grown
+}
+
 // ── Corpse persistence ─────────────────────────────────────────────
 
 /// Per-tick fade fraction for the decay matter one corpse leaves behind.
