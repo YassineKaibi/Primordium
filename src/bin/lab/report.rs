@@ -50,7 +50,7 @@ pub fn run(args: &Args, config: WorldConfig) {
 
 /// Decoded genes with the cell's active phase applied, which is what
 /// `actions::decide` gates on.
-fn effective(c: &Cell, d: &DecodedGenes) -> DecodedGenes {
+pub fn effective(c: &Cell, d: &DecodedGenes) -> DecodedGenes {
     let mut e = d.clone();
     apply_phase_modifiers(&mut e, &c.genome, c.active_phase);
     e
@@ -390,7 +390,7 @@ fn per_class(sim: &Simulation, cells: &[(u32, &Cell, DecodedGenes, usize)]) -> V
 }
 
 /// Whether `decide` would idle this cell as dormant (its gate 0).
-fn is_dormant(c: &Cell, e: &DecodedGenes, config: &WorldConfig) -> bool {
+pub fn is_dormant(c: &Cell, e: &DecodedGenes, config: &WorldConfig) -> bool {
     let cap = energy::storage_cap(e, config);
     let fraction = if cap > 0.0 { c.energy / cap } else { 0.0 };
     energy::dormancy_multiplier(e, fraction, config) < 1.0
