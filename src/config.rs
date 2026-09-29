@@ -196,7 +196,11 @@ pub struct WorldConfig {
 
     // Corpses
     /// Structural matter every corpse leaves behind, whatever its energy.
-    /// A starved cell has no energy left but still has a body.
+    /// A starved cell has no energy left but still has a body. The body was
+    /// never paid for, so this is energy made at death: at 50 a sessile
+    /// scavenger persists from rare after the old-age wave; at 75-100 the
+    /// scavengers feed on each other's corpses and fill the world
+    /// (handover step 20).
     pub corpse_biomass: f32,
     /// Ticks a body takes to grow to its full `corpse_biomass`: a corpse
     /// leaves `corpse_biomass * min(1, age / corpse_growth_ticks)` of body.
@@ -205,7 +209,8 @@ pub struct WorldConfig {
     /// runaway by t=10 000 at `corpse_biomass` 50 (handover step 20). See
     /// `energy::corpse_body`.
     pub corpse_growth_ticks: u32,
-    /// Share of a corpse's remaining energy that becomes decay matter.
+    /// Share of a corpse's remaining energy that becomes decay matter. 1.0:
+    /// a corpse is its baseline plus everything it still held.
     pub corpse_energy_fraction: f32,
     /// When true, the energy a dying cell still held stays with its body
     /// instead of vanishing: a killed cell's tile gets the part of its
@@ -344,8 +349,8 @@ impl Default for WorldConfig {
             max_maturity_ticks: 30,
             maturity_lifespan_fraction: 0.5,
 
-            corpse_biomass: 25.0,
-            corpse_energy_fraction: 0.5,
+            corpse_biomass: 50.0,
+            corpse_energy_fraction: 1.0,
             corpse_growth_ticks: 100,
             corpses_keep_energy: true,
 
