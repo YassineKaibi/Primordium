@@ -320,7 +320,7 @@ fn record_energy(world: &mut World, cell_id: u32, result: &energy::EnergyResult)
 
 // @veridikt
 // purpose: "Phase 5 — turn dead cells into decay matter, spawn toxin at death clusters, and age/cooldown/emit-pheromone for survivors"
-// triggers: World.kill_cell, World.deposit_decay, World.record, Genome.decode
+// triggers: World.kill_cell, World.deposit_decay, World.record, Genome.decode, Energy.corpse_body, Energy.corpse_decay_fade
 // because: "Toxin only forms where deaths cluster (>= toxin_generation_threshold within a radius), so mass die-offs poison their own ground — a negative-feedback brake on overcrowding"
 fn phase_cleanup(world: &mut World, config: &WorldConfig, cache: &mut DecodeCache) {
     let width = world.width;
@@ -348,8 +348,8 @@ fn phase_cleanup(world: &mut World, config: &WorldConfig, cache: &mut DecodeCach
         // Structural matter plus whatever energy is left. `abs()` used to turn
         // combat overkill into a bonus and left starved cells with ~nothing,
         // so scavengers had no food supply at all.
-        let decay_deposit =
-            config.corpse_biomass + cell.energy.max(0.0) * config.corpse_energy_fraction;
+        let decay_deposit = energy::corpse_body(cell.age, config)
+            + cell.energy.max(0.0) * config.corpse_energy_fraction;
         let cause = world.record(cell_id).death.unwrap_or(DeathCause::Other);
         world.stats.record_death(cause);
         world.stats.decay_deposited += decay_deposit as f64;
@@ -520,7 +520,10 @@ mod tests {
             let mut world = World::new(&config);
             let mut data = [0u8; genome::GENOME_LEN];
             data[genome::DECAY_RATE] = gene;
-            let id = world.spawn_cell(Cell::new(Genome::new(data), 0.0, (x, 0)));
+            // Grown past `corpse_growth_ticks`, so it leaves its full body.
+            let mut body = Cell::new(Genome::new(data), 0.0, (x, 0));
+            body.age = 200;
+            let id = world.spawn_cell(body);
             world.set_current_tile_cell_id(x, 0, id);
             world.prepare_next();
             let idx = world.tile_index(x, 0);
@@ -571,7 +574,9 @@ mod tests {
         ] {
             data[g] = 0;
         }
-        let cell = Cell::new(Genome::new(data), 0.05, (5, 5));
+        // Grown past `corpse_growth_ticks`: a newborn's body is still small.
+        let mut cell = Cell::new(Genome::new(data), 0.05, (5, 5));
+        cell.age = 200;
         let cell_id = world.spawn_cell(cell);
         world.set_current_tile_cell_id(5, 5, cell_id);
 
@@ -584,6 +589,49 @@ mod tests {
             "starved corpse left {decay}, expected at least {}",
             config.corpse_biomass
         );
+    }
+
+    /// A full body for every corpse made a short life an energy source: a
+    /// scavenger that starved young left more body than it cost to make, and
+    /// one seed ran away to 95 473 cells by t=10 000. With
+    /// `corpse_growth_ticks` a body grows with age: a newborn leaves little,
+    /// an old cell the whole `corpse_biomass`.
+    #[test]
+    fn a_young_corpse_leaves_less_body_than_an_old_one() {
+        use crate::sim::cell::Cell;
+        use crate::sim::genome::{GENOME_LEN, Genome};
+
+        let body = |age: u32, growth: u32| {
+            let config = WorldConfig {
+                corpse_growth_ticks: growth,
+                initial_decay_matter: 0.0,
+                ..small_config()
+            };
+            let mut world = World::new(&config);
+            // It starves this tick, so the deposit is (almost) the body alone.
+            let mut cell = Cell::new(Genome::new([0u8; GENOME_LEN]), 1e-4, (5, 5));
+            cell.age = age;
+            let id = world.spawn_cell(cell);
+            world.set_current_tile_cell_id(5, 5, id);
+            run_tick(&mut world, &config, &mut ChaCha8Rng::seed_from_u64(1));
+            (
+                world.current_grid()[world.tile_index(5, 5)].decay_energy,
+                config.corpse_biomass,
+            )
+        };
+
+        let (young_flat, biomass) = body(10, 0);
+        assert!(
+            (young_flat - biomass).abs() < 1e-3,
+            "without growth every body is full"
+        );
+        let (young, _) = body(10, 100);
+        assert!(
+            young < 0.15 * biomass,
+            "a 10-tick-old corpse left {young} of a {biomass} body"
+        );
+        let (old, _) = body(500, 100);
+        assert!((old - biomass).abs() < 1e-3, "an old corpse left {old}");
     }
 
     /// `docs/spec.md`, Decay Matter: a corpse leaves `corpse_biomass` plus
@@ -653,7 +701,9 @@ mod tests {
         ] {
             data[g] = 0;
         }
-        let cell = Cell::new(Genome::new(data), 0.1, (5, 5));
+        // Grown, so its body is more than nothing (`corpse_growth_ticks`).
+        let mut cell = Cell::new(Genome::new(data), 0.1, (5, 5));
+        cell.age = 200;
         let cell_id = world.spawn_cell(cell);
         world.set_current_tile_cell_id(5, 5, cell_id);
 

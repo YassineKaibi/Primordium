@@ -197,6 +197,13 @@ pub struct WorldConfig {
     /// Structural matter every corpse leaves behind, whatever its energy.
     /// A starved cell has no energy left but still has a body.
     pub corpse_biomass: f32,
+    /// Ticks a body takes to grow to its full `corpse_biomass`: a corpse
+    /// leaves `corpse_biomass * min(1, age / corpse_growth_ticks)` of body.
+    /// 0 turns growth off (every corpse leaves the full biomass, however
+    /// young), which let starving young scavengers feed each other into a
+    /// runaway by t=10 000 at `corpse_biomass` 50 (handover step 20). See
+    /// `energy::corpse_body`.
+    pub corpse_growth_ticks: u32,
     /// Share of a corpse's remaining energy that becomes decay matter.
     pub corpse_energy_fraction: f32,
     /// When true, the energy a dying cell still held stays with its body
@@ -337,6 +344,7 @@ impl Default for WorldConfig {
 
             corpse_biomass: 25.0,
             corpse_energy_fraction: 0.5,
+            corpse_growth_ticks: 100,
             corpses_keep_energy: false,
 
             max_predation_efficiency: 1.0,
