@@ -149,6 +149,10 @@ pub struct SenseResult {
     /// Decoded, phase-modified armour of `nearest_threat`, scaled to damage
     /// units (x255). Only filled when `attack_only_when_harmful` is on.
     pub nearest_threat_armor: f32,
+    /// Decoded, phase-modified membrane of `nearest_threat` (0.0-1.0), which
+    /// is what stands between it and venom. Only filled when
+    /// `attack_only_when_harmful` is on.
+    pub nearest_threat_membrane: f32,
     /// Every non-kin neighbour with its weapons, in scan order. Only filled
     /// when `flee_can_escape` is on.
     pub threats: Vec<Threat>,
@@ -291,12 +295,14 @@ pub fn decide(
 
     // Gate 2: Attack
     let attack_range = mapped_attack_range(genes);
-    // With `attack_only_when_harmful`, a blow that cannot get through the
-    // target's armour is not an attack at all, and the threat falls through
-    // to the Flee gate — otherwise harmless prey "fights" an adjacent
-    // predator instead of running.
+    // With `attack_only_when_harmful`, an attack that can get neither a blow
+    // through the target's armour nor venom through its membrane is not an
+    // attack at all, and the threat falls through to the Flee gate —
+    // otherwise harmless prey "fights" an adjacent predator instead of
+    // running. Venom counts because it lands whatever the armour.
     let can_hurt = !config.attack_only_when_harmful
-        || genes.get(genome::ATTACK_POWER) * 255.0 > sense.nearest_threat_armor;
+        || genes.get(genome::ATTACK_POWER) * 255.0 > sense.nearest_threat_armor
+        || venom_hurts(genes.get(genome::VENOM), sense.nearest_threat_membrane);
     if let Some((_tx, _ty, target_id, dist)) = sense.nearest_threat
         && dist <= attack_range
         && can_hurt
@@ -369,6 +375,20 @@ pub fn decide(
     Action::Idle
 }
 
+/// Whether venom of this strength costs a defender with this membrane any
+/// energy: `resolve_attack` applies it whatever the armour, and
+/// `venom_tick_damage` takes the membrane's share off each tick.
+fn venom_hurts(venom: f32, membrane: f32) -> bool {
+    let none = CombatStats {
+        cell_id: 0,
+        attack_power: 0.0,
+        armor: 0.0,
+        venom: 0.0,
+    };
+    let blow = resolve_attack(&CombatStats { venom, ..none }, &none);
+    blow.venom_ticks > 0 && crate::sim::energy::venom_tick_damage(blow.venom_damage, membrane) > 0.0
+}
+
 /// The nearest non-kin neighbour whose blow or venom would actually cost
 /// this cell energy — judged by the same exchange `resolve_attack` settles,
 /// against the cell's own armour and membrane.
@@ -393,9 +413,8 @@ fn nearest_danger<'a>(genes: &DecodedGenes, sense: &'a SenseResult) -> Option<&'
             venom: t.venom,
         };
         let blow = resolve_attack(&them, &me);
-        let venom_hurts = blow.venom_ticks > 0
-            && crate::sim::energy::venom_tick_damage(blow.venom_damage, membrane) > 0.0;
-        if (blow.damage_to_defender > 0.0 || venom_hurts) && nearest.is_none_or(|n| t.dist < n.dist)
+        if (blow.damage_to_defender > 0.0 || venom_hurts(t.venom, membrane))
+            && nearest.is_none_or(|n| t.dist < n.dist)
         {
             nearest = Some(t);
         }
@@ -847,16 +866,16 @@ pub fn sense_cached(
         }
     }
 
-    // What the nearest threat's armour would absorb, so `decide` can tell a
-    // blow that lands from a harmless one.
-    let nearest_threat_armor = match nearest_threat {
+    // What the nearest threat's armour and membrane would absorb, so
+    // `decide` can tell an attack that lands from a harmless one.
+    let (nearest_threat_armor, nearest_threat_membrane) = match nearest_threat {
         Some((_, _, id, _)) if config.attack_only_when_harmful => {
             let target = world.get_cell(id);
             let mut t = target.genome.decode(config);
             crate::sim::phase::apply_phase_modifiers(&mut t, &target.genome, target.active_phase);
-            t.get(genome::ARMOR) * 255.0
+            (t.get(genome::ARMOR) * 255.0, t.get(genome::MEMBRANE))
         }
-        _ => 0.0,
+        _ => (0.0, 0.0),
     };
 
     SenseResult {
@@ -873,6 +892,7 @@ pub fn sense_cached(
         empty_scatter,
         free_run,
         nearest_threat_armor,
+        nearest_threat_membrane,
         threats,
         own_food_share,
         world_size: (world.width, world.height),
@@ -1849,6 +1869,7 @@ mod tests {
             empty_scatter: vec![(6, 5), (4, 5), (5, 6), (5, 4)],
             free_run: [0; 8],
             nearest_threat_armor: 0.0,
+            nearest_threat_membrane: 0.0,
             threats: Vec::new(),
             own_food_share: 0.0,
             world_size: (16, 16),
@@ -2718,6 +2739,45 @@ mod tests {
                 Action::Flee(..)
             ),
             "a cell that cannot get through the threat's armour still attacked it"
+        );
+    }
+
+    /// `attack_only_when_harmful` judged only the blow against armour, so a
+    /// venomous cell whose blow the armour stops fled from prey its venom
+    /// would have hurt. Venom lands whatever the armour; only the membrane
+    /// stops it.
+    #[test]
+    fn a_venomous_cell_attacks_what_its_blow_cannot_hurt() {
+        let mut data = [0u8; GENOME_LEN];
+        data[genome::FLEE_RESPONSE] = 255;
+        data[genome::VENOM] = 255;
+        let cell = Cell::new(Genome::new(data), 10.0, (5, 5));
+        let config = WorldConfig {
+            attack_only_when_harmful: true,
+            ..WorldConfig::default()
+        };
+        let genes = Genome::new(data).decode(&config);
+        let mut rng = ChaCha8Rng::seed_from_u64(1);
+        let mut sense = base_sense_result();
+        sense.nearest_threat = Some((6, 5, 42, 1));
+        sense.nearest_threat_armor = 50.0;
+
+        sense.nearest_threat_membrane = 0.2;
+        assert!(
+            matches!(
+                decide(&cell, &genes, &sense, &config, &mut rng),
+                Action::Attack(42)
+            ),
+            "venom gets through a 0.2 membrane, so the attack can hurt"
+        );
+
+        sense.nearest_threat_membrane = 1.0;
+        assert!(
+            matches!(
+                decide(&cell, &genes, &sense, &config, &mut rng),
+                Action::Flee(..)
+            ),
+            "a full membrane stops the venom and the armour stops the blow"
         );
     }
 
