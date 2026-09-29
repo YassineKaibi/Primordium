@@ -150,7 +150,10 @@ pub fn scavenge_income(
 
 /// Calculate total metabolic energy drain per tick.
 ///
-/// Each gene's cost = `gene_value ^ exponent`, summed across all 46 genes.
+/// Each gene's cost = `gene_value ^ exponent`, summed across all 46 genes,
+/// or across all but `genome::RAW_READ_GENES` with
+/// `raw_genes_outside_expression`: nothing reads their decoded values, so
+/// they buy nothing to pay for.
 /// The superlinear exponent (default 1.5) makes high gene values
 /// disproportionately expensive — this is the core anti-supercell mechanic.
 ///
@@ -164,9 +167,14 @@ pub fn scavenge_income(
 // @veridikt
 // purpose: "Total per-tick energy drain: sum of each gene value raised to a superlinear exponent, plus a temperature-mismatch penalty"
 // because: "The superlinear exponent (default 1.5) is the core anti-supercell mechanic — maxing many genes costs disproportionately more than any income channel can supply, so generalists starve"
+// depends_on: Genome.RAW_READ_GENES
 pub fn metabolic_cost(decoded: &DecodedGenes, tile_temperature: u8, config: &WorldConfig) -> f32 {
+    let skip_raw = config.raw_genes_outside_expression;
     let mut base_cost = 0.0_f32;
-    for &value in decoded.values.iter() {
+    for (i, &value) in decoded.values.iter().enumerate() {
+        if skip_raw && genome::IS_RAW_READ[i] {
+            continue;
+        }
         base_cost += value.powf(config.metabolic_cost_exponent);
     }
     base_cost *= config.metabolic_cost_scale;

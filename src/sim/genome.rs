@@ -107,6 +107,34 @@ pub const ANTAGONISTIC_PAIRS: [(usize, usize, f32); 9] = [
     (ATTACK_RANGE, ATTACK_POWER, 0.7),
 ];
 
+// ── Raw-read genes ───────────────────────────────────────────────────
+/// Genes the simulation only ever reads straight from the genome bytes,
+/// never through `DecodedGenes`: `Genome::mutate` reads the mutation,
+/// linkage, transposon and horizontal-transfer bytes, and `sense` reads the
+/// kin-recognition pair raw (B12). Their decoded values drive nothing. By
+/// default they still compete for a top-N slot and cost upkeep; with
+/// `raw_genes_outside_expression` they do neither.
+pub const RAW_READ_GENES: [usize; 7] = [
+    AGGRESSION_TRIGGER,
+    MUTATION_RATE,
+    MUTATION_MAGNITUDE,
+    KIN_RECOGNITION_PRECISION,
+    GENE_LINKAGE,
+    HORIZONTAL_TRANSFER,
+    TRANSPOSON_RATE,
+];
+
+/// `RAW_READ_GENES` as a per-gene lookup.
+pub const IS_RAW_READ: [bool; BASE_GENE_COUNT] = {
+    let mut mask = [false; BASE_GENE_COUNT];
+    let mut i = 0;
+    while i < RAW_READ_GENES.len() {
+        mask[RAW_READ_GENES[i]] = true;
+        i += 1;
+    }
+    mask
+};
+
 // ── GenomeHash ───────────────────────────────────────────────────────
 /// A compact hash of the genome used for color mapping and kin recognition.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -161,12 +189,12 @@ impl Genome {
     // ── Expression pipeline ──────────────────────────────────────────
 
     /// Decode the genome into effective floating-point gene values.
-    /// Pipeline: raw -> antagonistic pairs -> top-N gating -> physical caps.
+    /// Pipeline: raw -> top-N gating -> antagonistic pairs -> physical caps.
 
     // @veridikt
     // purpose: "Turn raw genome bytes into the effective per-gene strengths that all downstream systems read"
-    // because: "The fixed order matters — antagonistic pairs, THEN top-N gating, THEN physical caps — so gating ranks genes by their already-penalized values and caps are enforced last"
-    // assumes: "config.top_n_gene_count and top_n_falloff define how aggressively non-dominant genes are suppressed"
+    // because: "The fixed order matters — top-N gating, THEN antagonistic pairs, THEN physical caps — so gating decides what a cell expresses by its own investment, the pairs trade off between what it does express, and caps are enforced last"
+    // assumes: "config.top_n_gene_count and top_n_falloff define how aggressively non-dominant genes are suppressed; with raw_genes_outside_expression the RAW_READ_GENES are not ranked"
     pub fn decode(&self, config: &WorldConfig) -> DecodedGenes {
         let mut eff = [0.0_f32; BASE_GENE_COUNT];
 
@@ -423,13 +451,12 @@ fn is_cost_gene(index: usize) -> bool {
 
 // @veridikt
 // purpose: "Force specialization: only the strongest ~top_n_gene_count genes express fully; the rest are scaled down by falloff"
-// because: "Without this a genome could be good at everything; gating means ~10-12 of 46 genes carry a cell, pushing populations into distinct niches"
+// because: "Without this a genome could be good at everything; gating means ~10-12 of 46 genes carry a cell, pushing populations into distinct niches. With raw_genes_outside_expression the RAW_READ_GENES are left out of the ranking: their decoded values drive nothing, so a slot spent on one was a capability gated for nothing (the archetype predator lost max_age that way, handover step 17)"
+// depends_on: Genome.RAW_READ_GENES
 fn apply_top_n_gating(eff: &mut [f32; BASE_GENE_COUNT], config: &WorldConfig) {
     let n = config.top_n_gene_count as usize;
     let falloff = config.top_n_falloff;
-    if n >= BASE_GENE_COUNT {
-        return;
-    }
+    let skip_raw = config.raw_genes_outside_expression;
 
     // Only the split at position N matters, not the order within each side,
     // so this selects rather than sorts: `decode` runs several times per cell
@@ -439,10 +466,22 @@ fn apply_top_n_gating(eff: &mut [f32; BASE_GENE_COUNT], config: &WorldConfig) {
     // a total order with no ties at all, which is what makes the partition
     // deterministic — and it is the same order the previous stable sort
     // produced, so the gated set is bit-identical.
+    //
+    // A gene left out of the ranking keeps its value: it neither takes a
+    // slot nor takes the falloff.
     let mut ranked: [(usize, f32); BASE_GENE_COUNT] = [(0, 0.0); BASE_GENE_COUNT];
-    for (idx, slot) in ranked.iter_mut().enumerate() {
-        *slot = (idx, eff[idx]);
+    let mut len = 0;
+    for (idx, &value) in eff.iter().enumerate() {
+        if skip_raw && IS_RAW_READ[idx] {
+            continue;
+        }
+        ranked[len] = (idx, value);
+        len += 1;
     }
+    if n >= len {
+        return;
+    }
+    let ranked = &mut ranked[..len];
     ranked.select_nth_unstable_by(n, |a, b| {
         b.1.partial_cmp(&a.1)
             .unwrap_or(std::cmp::Ordering::Equal)
@@ -526,6 +565,63 @@ mod tests {
              gated it out of the genome's own strongest gene",
             config.top_n_falloff
         );
+    }
+
+    /// Handover step 17: nothing reads the decoded mutation genes (`mutate`
+    /// reads the bytes), yet they held top-N slots and cost upkeep, so a
+    /// genome with high mutation bytes lost its `max_age` to the falloff.
+    /// With `raw_genes_outside_expression` a raw-read byte changes no other
+    /// gene's expression and no upkeep.
+    #[test]
+    fn raw_read_genes_neither_take_a_slot_nor_cost_upkeep() {
+        let decode = |raw: u8, config: &WorldConfig| {
+            let mut d = [0u8; GENOME_LEN];
+            // Eleven capability genes, then `max_age` as the twelfth: it
+            // expresses only if nothing else takes a slot.
+            for g in [
+                PHOTOSYNTHESIS_RATE,
+                ENERGY_STORAGE_CAP,
+                CHEMOTAXIS_STRENGTH,
+                ATTACK_POWER,
+                REPRODUCTION_THRESHOLD,
+                OFFSPRING_ENERGY_SHARE,
+                REPRODUCTION_COOLDOWN,
+                SENSE_RADIUS,
+                MEMBRANE,
+                MATURITY_AGE,
+                TEMPERATURE_PREFERENCE,
+            ] {
+                d[g] = 200;
+            }
+            d[MAX_AGE] = 150;
+            for g in RAW_READ_GENES {
+                d[g] = raw;
+            }
+            Genome::new(d).decode(config)
+        };
+        let upkeep = |genes: &DecodedGenes, config: &WorldConfig| {
+            crate::sim::energy::metabolic_cost(genes, 128, config)
+        };
+
+        let old = WorldConfig::default();
+        assert!(
+            decode(255, &old).get(MAX_AGE) < decode(0, &old).get(MAX_AGE),
+            "ranked with the rest, maxed raw genes should push max_age out"
+        );
+
+        let new = WorldConfig {
+            raw_genes_outside_expression: true,
+            ..WorldConfig::default()
+        };
+        let (low, high) = (decode(0, &new), decode(255, &new));
+        for i in (0..BASE_GENE_COUNT).filter(|&i| !IS_RAW_READ[i]) {
+            assert_eq!(low.get(i), high.get(i), "gene {i} moved with the raw bytes");
+        }
+        assert!(
+            high.get(MAX_AGE) > 150.0 / 255.0 - 1e-6,
+            "max_age was gated"
+        );
+        assert_eq!(upkeep(&low, &new), upkeep(&high, &new));
     }
 
     /// `docs/spec.md`: "effective_a = raw_a * (1 - raw_b_norm * factor)".

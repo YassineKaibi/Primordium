@@ -86,6 +86,15 @@ pub struct WorldConfig {
     /// Multiplier on the summed per-gene expression cost. The spec's shape
     /// (every gene costs, superlinearly) at a level a specialist can pay.
     pub metabolic_cost_scale: f32,
+    /// When true, the genes the simulation only reads raw from the genome
+    /// bytes (`genome::RAW_READ_GENES`: mutation rate and magnitude, gene
+    /// linkage, transposon rate, horizontal transfer, aggression trigger,
+    /// kin recognition precision) are left out of top-N gating and of
+    /// metabolic cost. Their decoded values drive nothing. When false they
+    /// still take top-N slots and cost upkeep: the archetype predator spends
+    /// two of its 12 slots on the mutation genes, which gates its `max_age`
+    /// to a 401-tick life (handover step 17).
+    pub raw_genes_outside_expression: bool,
 
     // Heredity
     /// Per-byte mutation probability when `mutation_rate` is at its maximum.
@@ -284,6 +293,7 @@ impl Default for WorldConfig {
             metabolic_cost_exponent: 1.5,
 
             metabolic_cost_scale: 0.2,
+            raw_genes_outside_expression: false,
 
             max_mutation_rate: 0.05,
             max_mutation_magnitude: 24,
