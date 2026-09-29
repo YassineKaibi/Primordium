@@ -125,6 +125,12 @@ pub struct WorldConfig {
     /// is attacked, however harmless the attacker — so prey "fights" an
     /// adjacent predator instead of running.
     pub attack_only_when_harmful: bool,
+    /// Fullness above which a cell stops hunting: with energy above this
+    /// fraction of its storage cap it takes no Attack action and falls
+    /// through to Flee/Move. 1.0 turns the check off. Without it a
+    /// self-replacing predator kept killing at the same rate however full it
+    /// was and ate every archetype web out (handover steps 18-19).
+    pub satiation_fraction: f32,
     /// When true, fleeing is a real escape. The Flee gate fires with
     /// probability `speed * flee_response` (a flight is a move, and takes the
     /// speed to make it), only from the nearest non-kin whose blow or venom
@@ -302,6 +308,7 @@ impl Default for WorldConfig {
 
             max_move_distance: 1,
             attack_only_when_harmful: false,
+            satiation_fraction: 1.0,
             flee_can_escape: false,
             food_targets_richest: false,
             foragers_stay_on_food: false,
