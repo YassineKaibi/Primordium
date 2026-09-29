@@ -303,9 +303,14 @@ pub fn decide(
     let can_hurt = !config.attack_only_when_harmful
         || genes.get(genome::ATTACK_POWER) * 255.0 > sense.nearest_threat_armor
         || venom_hurts(genes.get(genome::VENOM), sense.nearest_threat_membrane);
+    // A full cell does not hunt: above `satiation_fraction` of its storage
+    // cap it starts no attack (being attacked, it still hits back inside the
+    // exchange). At 1.0 the check is skipped, which is the old behaviour.
+    let sated = config.satiation_fraction < 1.0 && energy_fraction > config.satiation_fraction;
     if let Some((_tx, _ty, target_id, dist)) = sense.nearest_threat
         && dist <= attack_range
         && can_hurt
+        && !sated
     {
         return Action::Attack(target_id);
     }
@@ -2778,6 +2783,39 @@ mod tests {
                 Action::Flee(..)
             ),
             "a full membrane stops the venom and the armour stops the blow"
+        );
+    }
+
+    /// A predator kept killing whatever its energy, so one that could replace
+    /// itself ate every archetype web out (steps 18-19). With
+    /// `satiation_fraction` a cell fuller than that share of its cap starts
+    /// no attack; below it, it still does.
+    #[test]
+    fn a_full_cell_does_not_hunt() {
+        let mut data = [0u8; GENOME_LEN];
+        data[genome::ATTACK_POWER] = 255;
+        let config = WorldConfig {
+            satiation_fraction: 0.5,
+            ..WorldConfig::default()
+        };
+        let genes = Genome::new(data).decode(&config);
+        let cap = crate::sim::energy::storage_cap(&genes, &config);
+        let mut sense = base_sense_result();
+        sense.nearest_threat = Some((6, 5, 42, 1));
+        let mut rng = ChaCha8Rng::seed_from_u64(1);
+        let attacks = |energy: f32, config: &WorldConfig, rng: &mut ChaCha8Rng| {
+            let cell = Cell::new(Genome::new(data), energy, (5, 5));
+            matches!(
+                decide(&cell, &genes, &sense, config, rng),
+                Action::Attack(42)
+            )
+        };
+
+        assert!(attacks(0.4 * cap, &config, &mut rng), "a hungry cell hunts");
+        assert!(!attacks(0.6 * cap, &config, &mut rng), "a full cell hunted");
+        assert!(
+            attacks(0.6 * cap, &WorldConfig::default(), &mut rng),
+            "without the knob fullness changes nothing"
         );
     }
 
