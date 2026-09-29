@@ -163,6 +163,50 @@ pub fn fade_decay(tiles: &mut [Tile], default_rate: f32) {
     }
 }
 
+/// Move `rate` of every tile's decay matter one row down (toward the vents),
+/// carrying its fade rate with it. Rows are walked bottom-up, so what arrives
+/// in a row this tick does not sink again until the next one. The bottom row
+/// is the floor: its decay stays, rather than wrapping into the sunlit top
+/// row. A rate of 0 does nothing.
+///
+/// Decay never moved: a corpse fed only the tile it fell on, so a sessile
+/// scavenger lived on whatever died next to it, and the scavenger niche was
+/// a pulse (handover steps 15-17). Sinking turns the producers' deaths into a
+/// steady rain on the rows below them.
+
+// @veridikt
+// purpose: "Sink a fraction of each tile's decay matter one row toward the vents per tick, blending fade rates where it lands"
+// because: "Decay that never moves feeds only the tile a corpse fell on, so scavengers depended on a death next to them; sinking detritus gives the rows below the producers a steady supply"
+// assumes: "Called on the current grid after fade_decay; y grows downward and the bottom row (the vents) does not wrap to y = 0"
+pub fn sink_decay(tiles: &mut [Tile], width: u32, height: u32, rate: f32) {
+    if rate <= 0.0 || height < 2 {
+        return;
+    }
+    let w = width as usize;
+    for y in (0..height as usize - 1).rev() {
+        for x in 0..w {
+            let (src, dst) = (y * w + x, (y + 1) * w + x);
+            let held = tiles[src].decay_energy;
+            if held <= 0.0 {
+                continue;
+            }
+            let mut moved = held * rate;
+            let mut left = held - moved;
+            // Do not leave a trace below the flush floor behind.
+            if left < DECAY_FLUSH {
+                moved = held;
+                left = 0.0;
+            }
+            let fade = tiles[src].decay_fade;
+            let below = &mut tiles[dst];
+            let total = below.decay_energy + moved;
+            below.decay_fade = (below.decay_energy * below.decay_fade + moved * fade) / total;
+            below.decay_energy = total;
+            tiles[src].decay_energy = left;
+        }
+    }
+}
+
 /// Decay matter below this is cleared to exactly zero. A numerical floor,
 /// not a balance knob: at 0.01 a scavenger would earn 0.009 per tick.
 pub const DECAY_FLUSH: f32 = 0.01;
@@ -218,7 +262,8 @@ fn diffuse_field(
 /// decay fade, reusing the two float buffers from World.
 
 // @veridikt
-// purpose: "Tick phase 1 — diffuse pheromone (Moore), toxin (Von Neumann) and temperature (Moore) on the current grid, then fade decay matter"
+// purpose: "Tick phase 1 — diffuse pheromone (Moore), toxin (Von Neumann) and temperature (Moore) on the current grid, then fade decay matter and sink it (decay_sink_rate)"
+// triggers: Diffusion.fade_decay, Diffusion.sink_decay
 // because: "Passes reuse World.diffusion_a/diffusion_b scratch buffers instead of allocating per tick; pheromone uses Moore (8-way) while toxin uses Von Neumann (4-way) to give them visibly different spread shapes"
 pub fn run_diffusion_phase(world: &mut World, config: &WorldConfig) {
     let width = world.width;
@@ -259,6 +304,12 @@ pub fn run_diffusion_phase(world: &mut World, config: &WorldConfig) {
     let max_step = 255.0 * (config.temperature_decay + config.temperature_diffusion);
     if max_step < 0.5 {
         fade_decay(world.current_grid_mut(), config.decay_rate);
+        sink_decay(
+            world.current_grid_mut(),
+            width,
+            height,
+            config.decay_sink_rate,
+        );
         return;
     }
     let temp_config = DiffusionConfig {
@@ -292,6 +343,12 @@ pub fn run_diffusion_phase(world: &mut World, config: &WorldConfig) {
 
     // ── Decay fade ─────────────────────────────────────────────
     fade_decay(world.current_grid_mut(), config.decay_rate);
+    sink_decay(
+        world.current_grid_mut(),
+        width,
+        height,
+        config.decay_sink_rate,
+    );
 }
 
 // ── Tests ──────────────────────────────────────────────────────────
@@ -328,6 +385,52 @@ mod tests {
     /// Multiplicative fade never reaches zero, so without a floor every tile
     /// that ever held decay kept a trace forever and could never take the
     /// plain-water path in `recompute_sunlight`.
+    /// Decay never moved, so a corpse fed only the tile it fell on. With a
+    /// sink rate it moves one row toward the vents per tick, keeps its mass
+    /// and its fade rate, and settles on the bottom row instead of wrapping
+    /// to the top.
+    #[test]
+    fn decay_sinks_one_row_a_tick_and_settles_on_the_floor() {
+        let (w, h) = (3u32, 4u32);
+        let mut tiles = vec![Tile::EMPTY; (w * h) as usize];
+        let at = |x: usize, y: usize| y * w as usize + x;
+        tiles[at(1, 1)].decay_energy = 40.0;
+        tiles[at(1, 1)].decay_fade = 0.04;
+        tiles[at(1, 2)].decay_energy = 10.0;
+        tiles[at(1, 2)].decay_fade = 0.01;
+        tiles[at(1, 3)].decay_energy = 8.0;
+
+        let mut still = tiles.clone();
+        sink_decay(&mut still, w, h, 0.0);
+        let decay = |t: &[Tile]| t.iter().map(|t| t.decay_energy).collect::<Vec<_>>();
+        assert_eq!(
+            decay(&still),
+            decay(&tiles),
+            "a rate of 0 must change nothing"
+        );
+
+        sink_decay(&mut tiles, w, h, 0.5);
+        assert_eq!(tiles[at(1, 1)].decay_energy, 20.0);
+        // Row 2 kept half its own 10 and received half of row 1's 40; what
+        // arrived did not sink again this tick.
+        assert_eq!(tiles[at(1, 2)].decay_energy, 25.0);
+        // The floor received half of row 2's own 10 and lost nothing.
+        assert_eq!(tiles[at(1, 3)].decay_energy, 13.0);
+        let total: f32 = tiles.iter().map(|t| t.decay_energy).sum();
+        assert!((total - 58.0).abs() < 1e-4, "mass changed: {total}");
+        // The 20 that arrived from row 1 brought its 0.04 fade with it.
+        let fade = tiles[at(1, 2)].decay_fade;
+        assert!(
+            (fade - (5.0 * 0.01 + 20.0 * 0.04) / 25.0).abs() < 1e-6,
+            "fade {fade}"
+        );
+        assert_eq!(
+            tiles[at(1, 0)].decay_energy,
+            0.0,
+            "nothing wrapped to the top"
+        );
+    }
+
     #[test]
     fn decay_fades_all_the_way_to_zero() {
         let mut tiles = vec![Tile::EMPTY; 1];

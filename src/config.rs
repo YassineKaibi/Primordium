@@ -61,6 +61,10 @@ pub struct WorldConfig {
 
     // Decay
     pub decay_rate: f32,
+    /// Share of each tile's decay matter that sinks one row toward the vents
+    /// every tick. At 0 decay stays where the corpse fell, so it feeds only
+    /// that tile.
+    pub decay_sink_rate: f32,
     /// Decay matter every tile starts the run with. Without it the scavenger
     /// niche does not exist until the first cells die of old age, roughly
     /// 300-1300 ticks in, and a scavenger's runway is its storage cap over
@@ -285,6 +289,7 @@ impl Default for WorldConfig {
             toxin_generation_radius: 2,
 
             decay_rate: 0.02,
+            decay_sink_rate: 0.0,
             initial_decay_matter: 8.0,
             corpse_decay_scale_min: 0.1,
             corpse_decay_scale_max: 2.0,
