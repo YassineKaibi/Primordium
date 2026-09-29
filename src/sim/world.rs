@@ -184,6 +184,7 @@ impl World {
             config.grid_width,
             config.grid_height,
             config.sunlight_gradient_strength,
+            config.cell_light_absorption,
         );
 
         // Place thermal vents evenly along the bottom edge
@@ -429,13 +430,15 @@ impl World {
     }
 
     /// Recompute sunlight on the current grid using Beer-Lambert column scan.
-    /// Call this each tick after diffusion, before sensing.
-    pub fn update_sunlight(&mut self, base_alpha: f32) {
+    /// Call this each tick after diffusion, before sensing. `cell_alpha` is
+    /// what one occupied tile adds to the column's absorption.
+    pub fn update_sunlight(&mut self, base_alpha: f32, cell_alpha: f32) {
         recompute_sunlight(
             &mut self.grids[self.current],
             self.width,
             self.height,
             base_alpha,
+            cell_alpha,
         );
     }
 
@@ -678,7 +681,16 @@ pub fn strategy_of(decoded: &DecodedGenes) -> (Strategy, f32) {
     (strategy, specialization)
 }
 
-pub fn recompute_sunlight(grid: &mut [Tile], width: u32, height: u32, base_alpha: f32) {
+// @veridikt
+// purpose: "Beer-Lambert column scan: light enters at y = 0 and each tile attenuates it by water depth, cells (cell_light_absorption), decay, toxin and pheromone"
+// because: "An occupied tile shading the rows below is what makes depth a niche axis; the per-cell absorption is config so the photic band's depth can be tuned"
+pub fn recompute_sunlight(
+    grid: &mut [Tile],
+    width: u32,
+    height: u32,
+    base_alpha: f32,
+    cell_alpha: f32,
+) {
     // Per-row base absorption from water depth alone
     let water_alpha = base_alpha / height as f32;
     // Most tiles are plain water, whose attenuation is the same constant
@@ -707,16 +719,16 @@ pub fn recompute_sunlight(grid: &mut [Tile], width: u32, height: u32, base_alpha
             *light *= if plain_water {
                 water_attenuation
             } else {
-                (-tile_absorption(tile, water_alpha)).exp()
+                (-tile_absorption(tile, water_alpha, cell_alpha)).exp()
             };
         }
     }
 }
 
-fn tile_absorption(tile: &Tile, water_alpha: f32) -> f32 {
+fn tile_absorption(tile: &Tile, water_alpha: f32, cell_alpha: f32) -> f32 {
     let mut tile_alpha = water_alpha;
     if tile.cell_id != 0 {
-        tile_alpha += 0.2;
+        tile_alpha += cell_alpha;
     }
     tile_alpha += tile.decay_energy * 0.004 + tile.toxin * 0.002 + tile.pheromone * 0.001;
     tile_alpha
@@ -878,12 +890,39 @@ mod tests {
             let idx = (y * config.grid_width) as usize;
             w.grids[w.current][idx].toxin = 50.0;
         }
-        w.update_sunlight(config.sunlight_gradient_strength);
+        w.update_sunlight(
+            config.sunlight_gradient_strength,
+            config.cell_light_absorption,
+        );
 
         let after_toxin = w.current_tile(0, 15).sunlight;
         assert!(
             after_toxin < baseline,
             "toxin should reduce sunlight: baseline={baseline}, after={after_toxin}"
+        );
+    }
+
+    /// The light a cell takes from the column below it was a hard-coded 0.2
+    /// in `tile_absorption`; it is `cell_light_absorption` now, so how deep a
+    /// colony shades itself out can be tuned.
+    #[test]
+    fn a_cell_shades_the_tiles_below_it_by_the_configured_absorption() {
+        let below = |alpha: f32| {
+            let config = WorldConfig {
+                cell_light_absorption: alpha,
+                ..small_config()
+            };
+            let mut w = World::new(&config);
+            for y in 0..4u16 {
+                w.set_current_tile_cell_id(3, y, 1);
+            }
+            w.update_sunlight(config.sunlight_gradient_strength, alpha);
+            w.current_tile(3, 4).sunlight
+        };
+        let (dense, thin) = (below(0.2), below(0.05));
+        assert!(
+            thin > dense + 50,
+            "four cells at 0.05 left {thin}, at 0.2 {dense}: the knob should matter"
         );
     }
 
@@ -1018,7 +1057,7 @@ mod tests {
     #[test]
     fn prepare_next_carries_environment_and_clears_cells() {
         let mut w = World::new(&small_config());
-        w.update_sunlight(0.1);
+        w.update_sunlight(0.1, 0.2);
         let idx = w.tile_index(5, 5);
         let t = &mut w.current_grid_mut()[idx];
         t.decay_energy = 30.0;

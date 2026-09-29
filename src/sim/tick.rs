@@ -64,7 +64,10 @@ pub fn run_tick_cached(
     // Phase 1: Diffusion & environment
     diffusion::run_diffusion_phase(world, config);
     lap(world, 0);
-    world.update_sunlight(config.sunlight_gradient_strength);
+    world.update_sunlight(
+        config.sunlight_gradient_strength,
+        config.cell_light_absorption,
+    );
     lap(world, 1);
     world.prepare_next();
     lap(world, 2);

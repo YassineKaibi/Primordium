@@ -36,6 +36,11 @@ pub struct WorldConfig {
 
     // Energy sources
     pub sunlight_gradient_strength: f32,
+    /// Beer-Lambert absorption one occupied tile adds to its light column,
+    /// on top of the water's. At 0.2 a cell takes 18% of the light from
+    /// everything below it, so a colony a few rows deep shades itself out
+    /// and life sits in a band of ~9-35 rows.
+    pub cell_light_absorption: f32,
     pub vent_count: u32,
     pub vent_output: f32,
     /// How far a vent's output reaches, in tiles (Chebyshev). The bottom
@@ -251,6 +256,7 @@ impl Default for WorldConfig {
             grid_height: 512,
 
             sunlight_gradient_strength: 1.0,
+            cell_light_absorption: 0.2,
             vent_count: 12,
             vent_output: 40.0,
             vent_radius: 6,
