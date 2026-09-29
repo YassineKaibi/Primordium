@@ -154,7 +154,8 @@ pub struct WorldConfig {
     /// `share` is its own tile's food against the richest other food tile in
     /// sense range. When false, a mobile forager moves on its speed roll
     /// whatever it stands on, and a scavenger walks off a corpse it could
-    /// have eaten for eight ticks.
+    /// have eaten for eight ticks. On by default since step 16 measured
+    /// default-world scavengers +404 ± 190 with it.
     pub foragers_stay_on_food: bool,
     /// When true, `sense_radius` maps onto the spec's 1-4 tiles
     /// (`ceil(gene * 4)`); when false onto 1-3 (`ceil(gene * 3)`, whose
@@ -212,7 +213,8 @@ pub struct WorldConfig {
     /// age leaves `corpse_energy_fraction` of its energy like any other
     /// corpse (`docs/spec.md`, Decay Matter). When false, senescence zeroes
     /// the energy first, so an old corpse leaves only `corpse_biomass`, and
-    /// whatever a kill does not pay the killer is lost.
+    /// whatever a kill does not pay the killer is lost. On by default: it is
+    /// what the spec says a corpse leaves.
     pub corpses_keep_energy: bool,
 
     // Predation
@@ -328,7 +330,7 @@ impl Default for WorldConfig {
             satiation_fraction: 1.0,
             flee_can_escape: false,
             food_targets_richest: false,
-            foragers_stay_on_food: false,
+            foragers_stay_on_food: true,
             full_sense_range: false,
 
             max_adaptation_rate: 0.02,
@@ -345,7 +347,7 @@ impl Default for WorldConfig {
             corpse_biomass: 25.0,
             corpse_energy_fraction: 0.5,
             corpse_growth_ticks: 100,
-            corpses_keep_energy: false,
+            corpses_keep_energy: true,
 
             max_predation_efficiency: 1.0,
 

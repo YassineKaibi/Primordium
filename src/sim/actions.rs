@@ -3017,6 +3017,7 @@ mod tests {
             grid_height: 16,
             vent_count: 0,
             initial_decay_matter: 0.0,
+            foragers_stay_on_food: false,
             ..WorldConfig::default()
         };
         let mut data = [0u8; GENOME_LEN];
