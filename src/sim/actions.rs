@@ -205,8 +205,8 @@ fn mapped_attack_range(genes: &DecodedGenes) -> u16 {
 ///
 /// `decode` has already capped the gene by `speed` (Physical Caps: "can't
 /// patrol unreachable area").
-fn mapped_territorial_radius(genes: &DecodedGenes) -> i32 {
-    let reach = mapped_sense_radius(genes) as f32;
+fn mapped_territorial_radius(genes: &DecodedGenes, config: &WorldConfig) -> i32 {
+    let reach = mapped_sense_radius(genes, config) as f32;
     (genes.get(genome::TERRITORIAL_RADIUS) * reach).round() as i32
 }
 
@@ -215,8 +215,8 @@ fn mapped_territorial_radius(genes: &DecodedGenes) -> i32 {
 ///
 /// `decode` has already capped the gene by `sense_radius` (Physical Caps),
 /// so this only has to turn it into tiles.
-fn mapped_offspring_scatter(genes: &DecodedGenes) -> i32 {
-    let reach = mapped_sense_radius(genes) as f32;
+fn mapped_offspring_scatter(genes: &DecodedGenes, config: &WorldConfig) -> i32 {
+    let reach = mapped_sense_radius(genes, config) as f32;
     ((genes.get(genome::OFFSPRING_SCATTER) * reach).ceil() as i32).max(1)
 }
 
@@ -362,7 +362,7 @@ pub fn decide(
         move_chance *= 1.0 - genes.get(genome::CHEMOTAXIS_STRENGTH) * sense.own_food_share;
     }
     if rng.r#gen::<f32>() < move_chance
-        && let Some(step) = compute_move_target(cell, genes, sense, rng)
+        && let Some(step) = compute_move_target(cell, genes, sense, config, rng)
     {
         let (mx, my) = extend_move(cell.position, step, genes, sense, config);
         return Action::Move(mx, my);
@@ -482,6 +482,7 @@ fn compute_move_target(
     cell: &Cell,
     genes: &DecodedGenes,
     sense: &SenseResult,
+    config: &WorldConfig,
     rng: &mut impl rand::Rng,
 ) -> Option<(u16, u16)> {
     if sense.empty_adjacent.is_empty() {
@@ -533,7 +534,7 @@ fn compute_move_target(
             toroidal_delta(cx, tx, width) as f32,
             toroidal_delta(cy, ty, height) as f32,
         );
-        let territory = mapped_territorial_radius(genes);
+        let territory = mapped_territorial_radius(genes, config);
         if threat_dist as i32 <= territory {
             add_unit(
                 &mut hx,
@@ -609,9 +610,21 @@ fn compute_move_target(
 
 // ── Sense function ─────────────────────────────────────────────────
 
-/// Map the decoded sense_radius gene (0.0-1.0) to 1-4 tiles.
-fn mapped_sense_radius(genes: &DecodedGenes) -> u16 {
-    let raw = (genes.get(genome::SENSE_RADIUS) * 3.0).ceil() as u16;
+/// Map the decoded sense_radius gene (0.0-1.0) to tiles: 1-4 with
+/// `full_sense_range` (`docs/spec.md` gene 23, "detection range 1-4"),
+/// otherwise 1-3.
+///
+/// The old mapping, kept as the default, is `ceil(gene * 3)` clamped to 1-4:
+/// the ceiling is 3, so the clamp's 4 never binds and no cell sees past 3
+/// tiles, which also caps every radius derived from this one (territory,
+/// offspring scatter, a multi-tile move).
+
+// @veridikt
+// purpose: "Map the sense_radius gene onto a tile radius, the spec's 1-4 with full_sense_range and 1-3 without"
+// because: "ceil(gene * 3) never reaches the clamp's 4, so the spec's widest sense range was unreachable; the switch keeps the old mapping as the default so existing runs stay bit-identical"
+fn mapped_sense_radius(genes: &DecodedGenes, config: &WorldConfig) -> u16 {
+    let span = if config.full_sense_range { 4.0 } else { 3.0 };
+    let raw = (genes.get(genome::SENSE_RADIUS) * span).ceil() as u16;
     raw.clamp(1, 4)
 }
 
@@ -646,7 +659,7 @@ pub fn sense_cached(
     cache: &mut DecodeCache,
 ) -> SenseResult {
     let (cx, cy) = cell.position;
-    let radius = mapped_sense_radius(genes);
+    let radius = mapped_sense_radius(genes, config);
 
     let local_tile = TileSnapshot::from_tile(world.current_tile(cx, cy));
 
@@ -838,7 +851,7 @@ pub fn sense_cached(
     // movement and flee; `empty_scatter` reaches as far as the cell's
     // offspring_scatter gene allows, which is how a lineage disperses
     // instead of only ever budding into the tile next door.
-    let scatter = mapped_offspring_scatter(genes);
+    let scatter = mapped_offspring_scatter(genes, config);
     let mut empty_adjacent = Vec::new();
     let mut empty_scatter = Vec::new();
     for dy in -scatter..=scatter {
@@ -2051,7 +2064,7 @@ mod tests {
             let mut sense = base_sense_result();
             sense.nearest_food = Some((5, 8)); // three tiles south
             let mut rng = ChaCha8Rng::seed_from_u64(3);
-            compute_move_target(&cell, &genes, &sense, &mut rng).unwrap()
+            compute_move_target(&cell, &genes, &sense, &config, &mut rng).unwrap()
         };
 
         assert_eq!(
@@ -2108,7 +2121,7 @@ mod tests {
 
         let (mut ccw, mut cw) = (0, 0);
         for _ in 0..4000 {
-            match compute_move_target(&cell, &genes, &sense, &mut rng).unwrap() {
+            match compute_move_target(&cell, &genes, &sense, &config, &mut rng).unwrap() {
                 (5, 6) => ccw += 1,
                 (5, 4) => cw += 1,
                 _ => {}
@@ -2137,7 +2150,7 @@ mod tests {
         sense.empty_adjacent = vec![(15, 5), (1, 5), (0, 4), (0, 6)];
         let mut rng = ChaCha8Rng::seed_from_u64(7);
 
-        let target = compute_move_target(&cell, &genes, &sense, &mut rng).unwrap();
+        let target = compute_move_target(&cell, &genes, &sense, &config, &mut rng).unwrap();
         assert_eq!(
             target,
             (15, 5),
@@ -2819,6 +2832,26 @@ mod tests {
         );
     }
 
+    /// `docs/spec.md` gene 23: detection range 1-4. `ceil(gene * 3)` never
+    /// reaches 4, so a maxed sense_radius saw 3 tiles.
+    #[test]
+    fn a_maxed_sense_radius_reaches_the_spec_s_four_tiles() {
+        let mut data = [0u8; GENOME_LEN];
+        data[genome::SENSE_RADIUS] = 255;
+        let old = WorldConfig::default();
+        let genes = Genome::new(data).decode(&old);
+        assert_eq!(mapped_sense_radius(&genes, &old), 3);
+
+        let full = WorldConfig {
+            full_sense_range: true,
+            ..WorldConfig::default()
+        };
+        assert_eq!(mapped_sense_radius(&genes, &full), 4);
+        data[genome::SENSE_RADIUS] = 0;
+        let blind = Genome::new(data).decode(&full);
+        assert_eq!(mapped_sense_radius(&blind, &full), 1);
+    }
+
     /// Flee had no roll and no judgement: any non-kin in sight sent a cell
     /// with any flee_response at all running, every tick — including from a
     /// neighbour whose blow its armour stops. With `flee_can_escape` a cell
@@ -3053,11 +3086,11 @@ mod tests {
         let near = Genome::new(data).decode(&config);
 
         assert!(
-            mapped_offspring_scatter(&far) > 1,
+            mapped_offspring_scatter(&far, &config) > 1,
             "a maxed offspring_scatter still only reaches {} tile(s)",
-            mapped_offspring_scatter(&far)
+            mapped_offspring_scatter(&far, &config)
         );
-        assert_eq!(mapped_offspring_scatter(&near), 1);
+        assert_eq!(mapped_offspring_scatter(&near, &config), 1);
 
         // And the gate really draws from the wider set.
         let mut world = World::new(&config);

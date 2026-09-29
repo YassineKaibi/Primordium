@@ -156,6 +156,11 @@ pub struct WorldConfig {
     /// whatever it stands on, and a scavenger walks off a corpse it could
     /// have eaten for eight ticks.
     pub foragers_stay_on_food: bool,
+    /// When true, `sense_radius` maps onto the spec's 1-4 tiles
+    /// (`ceil(gene * 4)`); when false onto 1-3 (`ceil(gene * 3)`, whose
+    /// clamp to 4 never binds). Every radius derived from it (territory,
+    /// offspring scatter, a multi-tile move) widens with it.
+    pub full_sense_range: bool,
 
     // Adaptation
     /// Fraction of the gap between a cell's effective temperature preference
@@ -317,6 +322,7 @@ impl Default for WorldConfig {
             flee_can_escape: false,
             food_targets_richest: false,
             foragers_stay_on_food: false,
+            full_sense_range: false,
 
             max_adaptation_rate: 0.02,
 
